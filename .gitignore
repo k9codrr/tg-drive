@@ -14,3 +14,4 @@ drive-agent/run-mount.vbs
 drive-agent/mount.log
 drive-agent/*.log
 drive-agent/*.log.old
+drive-agent/run-server.vbs
