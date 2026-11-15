@@ -1,0 +1,14 @@
+node_modules
+.next
+out
+.env
+.env.local
+.env*.local
+.vercel
+*.tsbuildinfo
+.DS_Store
+
+# drive-agent local state
+drive-agent/agent.json
+drive-agent/run-mount.vbs
+drive-agent/mount.log
