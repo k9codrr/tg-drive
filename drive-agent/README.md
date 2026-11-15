@@ -78,7 +78,11 @@ model OneDrive's "Files On-Demand" and Dropbox use.
 2. In the web app, click **PC drive** -> **Add this PC**, and copy the command it shows.
 3. Run that command in PowerShell in the tg-drive folder. It installs WinFsp + rclone (winget), logs
    in, mounts `T:` and registers the "TG Drive mount" login task.
-4. Projects: `tgd push C:\projects\conferio`, `tgd work conferio`, `tgd save conferio`,
+4. Optional, on the PC that hosts TG Drive: `powershell -ExecutionPolicy Bypass -File drive-agent\install-server.ps1`
+   registers the "TG Drive server" login task. It runs `next start` hidden, rebuilds when the git commit
+   changed, and restarts the server if it crashes. Log: `drive-agent\server.log`. Undo with `-Remove`.
+   While `npm run dev` holds port 3020, it waits and doesn't start a second copy.
+5. Projects: `tgd push C:\projects\conferio`, `tgd work conferio`, `tgd save conferio`,
    `tgd park conferio`, `tgd list`.
 
 The Cloudflare tunnel sends `https://drive.xivago.com/dav/...` to the WebDAV server, so other PCs can
