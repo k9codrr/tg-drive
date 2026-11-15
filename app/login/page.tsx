@@ -1,6 +1,6 @@
 "use client";
 
-import { Eye, EyeOff, HardDrive, Loader2 } from "lucide-react";
+import { Eye, EyeOff, HardDrive, KeyRound, Loader2 } from "lucide-react";
 import { useEffect, useState, type FormEvent } from "react";
 
 type Mode = "login" | "signup";
@@ -16,12 +16,20 @@ export default function AuthPage() {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [showPw, setShowPw] = useState(false);
+  const [sso, setSso] = useState<{ id: string; name: string }[]>([]);
+  const [passwordOn, setPasswordOn] = useState(true);
 
   useEffect(() => {
-    if (new URLSearchParams(window.location.search).get("mode") === "signup") setMode("signup");
+    const qs = new URLSearchParams(window.location.search);
+    if (qs.get("mode") === "signup") setMode("signup");
+    if (qs.get("error")) setError(qs.get("error")!); // from a failed single sign-on
     fetch("/api/auth/config")
       .then((r) => r.json())
-      .then((d) => setPolicy(d.signup))
+      .then((d) => {
+        setPolicy(d.signup);
+        setSso(Array.isArray(d.sso) ? d.sso : []);
+        setPasswordOn(d.password !== false);
+      })
       .catch(() => setPolicy({ allowed: true, needsCode: false }));
   }, []);
 
@@ -73,6 +81,23 @@ export default function AuthPage() {
           one place.
         </p>
 
+        {sso.length > 0 && (
+          <div className="formStack">
+            {sso.map((p) => (
+              <a key={p.id} className="btn" href={`/api/auth/sso/${p.id}`}>
+                <KeyRound size={16} aria-hidden /> Continue with {p.name}
+              </a>
+            ))}
+            {passwordOn && <p className="muted small" style={{ textAlign: "center" }}>or with email and password</p>}
+          </div>
+        )}
+        {!passwordOn && error && (
+          <p className="loginError" role="alert">
+            {error}
+          </p>
+        )}
+        {passwordOn && (
+        <>
         {policy?.allowed && (
           <div className="tabs">
             <button type="button" className={!signup ? "active" : ""} onClick={() => switchMode("login")}>
@@ -90,7 +115,7 @@ export default function AuthPage() {
         <input
           type="email"
           required
-          autoFocus
+          autoFocus={sso.length === 0}
           placeholder="Email"
           aria-label="Email"
           value={email}
@@ -143,6 +168,8 @@ export default function AuthPage() {
           {busy ? "Please wait…" : signup ? "Create account" : "Sign in"}
         </button>
         {policy && !policy.allowed && <p className="muted small">New sign-ups are closed on this server.</p>}
+        </>
+        )}
       </form>
     </div>
   );

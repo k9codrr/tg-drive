@@ -3,6 +3,7 @@ import { clearFolderCache } from "@/lib/dav/fs";
 import { big, prisma } from "@/lib/db";
 import { cleanName, fail, HttpError, parseId, readJson } from "@/lib/http";
 import { requireUser } from "@/lib/session";
+import { folderAccess, requireCan, requireEdit, requireFolderRemoval, requireNotShareRoot } from "@/lib/space";
 import { deleteForever, trashFolder } from "@/lib/trash";
 
 export const runtime = "nodejs";
@@ -17,15 +18,20 @@ export async function PATCH(req: Request, { params }: Ctx) {
     const id = parseId((await params).id);
     if (!id) throw new HttpError(400, "Invalid id");
     const body = await readJson(req);
+    const { space, folder } = await folderAccess(uid, id, "view");
     const data: { name?: string; starred?: boolean } = {};
-    if ("name" in body) data.name = cleanName(body.name);
-    if ("starred" in body) data.starred = body.starred === true;
-    const { count } = await prisma.folder.updateMany({
-      where: { id: big(id), userId: big(uid) },
-      data,
-    });
+    if ("name" in body) {
+      requireEdit(space, folder.userId);
+      requireNotShareRoot(space, "folder", folder.id);
+      data.name = cleanName(body.name);
+    }
+    if ("starred" in body) {
+      if (space.share) throw new HttpError(403, "You can't star items someone shared with you");
+      requireCan(space, "upload"); // stars are shared within a team
+      data.starred = body.starred === true;
+    }
+    await prisma.folder.update({ where: { id: big(id) }, data });
     clearFolderCache(); // old path must stop resolving on the WebDAV drive
-    if (!count) throw new HttpError(404, "Folder not found");
     return NextResponse.json({ ok: true });
   } catch (e) {
     return fail(e);
@@ -34,15 +40,17 @@ export async function PATCH(req: Request, { params }: Ctx) {
 
 // DELETE /api/folders/:id            → moves the folder (and everything in it) to the trash
 // DELETE /api/folders/:id?forever=1  → deletes it, all subfolders, files and their stored bytes for good
+// In a team, members may only remove folders they created that hold nothing added by others.
 export async function DELETE(req: Request, { params }: Ctx) {
   try {
     const uid = await requireUser(req);
     const id = parseId((await params).id);
     if (!id) throw new HttpError(400, "Invalid id");
-    const n = await prisma.folder.count({ where: { id: big(id), userId: big(uid) } });
-    if (!n) throw new HttpError(404, "Folder not found");
-    if (new URL(req.url).searchParams.get("forever") === "1") await deleteForever(uid, [], [big(id)]);
-    else await trashFolder(uid, big(id));
+    const { space, folder } = await folderAccess(uid, id, "view");
+    const forever = new URL(req.url).searchParams.get("forever") === "1";
+    await requireFolderRemoval(space, big(id), folder.userId, forever);
+    if (forever) await deleteForever(space, [], [big(id)]);
+    else await trashFolder(space, big(id));
     return NextResponse.json({ ok: true });
   } catch (e) {
     return fail(e);

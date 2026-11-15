@@ -3,6 +3,7 @@ import { prisma } from "@/lib/db";
 import { fail, HttpError, readJson } from "@/lib/http";
 import { verifyPassword } from "@/lib/password";
 import { setSession } from "@/lib/session";
+import { passwordLoginEnabled } from "@/lib/sso";
 
 export const runtime = "nodejs";
 
@@ -10,6 +11,7 @@ export const runtime = "nodejs";
 export async function POST(req: Request) {
   try {
     if (!process.env.SESSION_SECRET) throw new HttpError(500, "Server not configured: set SESSION_SECRET");
+    if (!passwordLoginEnabled()) throw new HttpError(403, "Sign in with single sign-on");
     const body = await readJson(req);
     const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
     const password = typeof body.password === "string" ? body.password : "";

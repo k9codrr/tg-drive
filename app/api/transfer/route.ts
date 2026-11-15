@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { fail, HttpError, parseId, readJson } from "@/lib/http";
 import { requireUser } from "@/lib/session";
+import { requireCan, spaceFor } from "@/lib/space";
 import { parseTarget } from "@/lib/storage";
 import { filesToMove } from "@/lib/transfer";
 
@@ -15,7 +16,7 @@ const ids = (v: unknown) =>
         .map((x) => BigInt(x))
     : [];
 
-// POST /api/transfer { files: [ids], folders: [ids], target } → the files that need moving
+// POST /api/transfer { files: [ids], folders: [ids], target, team? } → the files that need moving
 // (folders are expanded; files already on the target are left out). Then call
 // POST /api/files/:id/transfer for each until it says done.
 export async function POST(req: Request) {
@@ -26,7 +27,10 @@ export async function POST(req: Request) {
     const files = ids(body.files);
     const folders = ids(body.folders);
     if (!files.length && !folders.length) throw new HttpError(400, "Nothing selected");
-    return NextResponse.json({ files: await filesToMove(uid, files, folders, target) });
+    // Only items in this space are considered; the rest are ignored.
+    const space = await spaceFor(uid, body.team);
+    requireCan(space, "moveStorage");
+    return NextResponse.json({ files: await filesToMove(space, files, folders, target) });
   } catch (e) {
     return fail(e);
   }

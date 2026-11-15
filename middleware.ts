@@ -7,7 +7,11 @@ const PUBLIC = new Set(["/login", "/api/auth/login", "/api/auth/signup", "/api/a
 // (API routes also check the session themselves and scope data to that user.)
 export async function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl;
-  if (PUBLIC.has(pathname)) return NextResponse.next();
+  // Single sign-on round trips start and finish before there's a session.
+  // /agent/* serves the PC drive setup scripts (no secrets in them).
+  if (PUBLIC.has(pathname) || pathname.startsWith("/api/auth/sso/") || pathname.startsWith("/agent/")) {
+    return NextResponse.next();
+  }
 
   if (await verifyToken(req.cookies.get(COOKIE)?.value)) return NextResponse.next();
 

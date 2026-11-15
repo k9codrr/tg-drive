@@ -32,7 +32,11 @@ export const fileOutSelect = {
   backend: true,
   starred: true,
   trashedAt: true,
+  userId: true,
+  teamId: true,
+  encryption: true,
   gdAccount: { select: { email: true } },
+  user: { select: { name: true, email: true } },
 } satisfies Prisma.FileSelect;
 
 export type FileOutRow = Prisma.FileGetPayload<{ select: typeof fileOutSelect }>;
@@ -50,6 +54,11 @@ export function fileOut(r: FileOutRow) {
     account: r.gdAccount?.email ?? null,
     starred: r.starred,
     trashedAt: r.trashedAt,
+    // Who added it (matters in team spaces: members may only edit their own items).
+    ownerId: r.userId == null ? null : String(r.userId),
+    addedBy: r.teamId != null && r.user ? r.user.name || r.user.email : null,
+    // Password-encrypted (only the flag: the wrapped keys never leave the server).
+    encrypted: r.encryption != null,
   };
 }
 
@@ -60,27 +69,4 @@ export function byName<T extends { name: string }>(rows: T[]) {
     const y = b.name.toLowerCase();
     return x < y ? -1 : x > y ? 1 : 0;
   });
-}
-
-/** Find-or-create a folder by name inside parent (null = root) for a user. */
-export async function ensureFolder(uid: string, parentId: string | null, name: string): Promise<string> {
-  const where = { userId: big(uid), parentId: bigOrNull(parentId), name };
-  const live = { ...where, trashedAt: null };
-  const found = await prisma.folder.findFirst({ where: live, select: { id: true } });
-  if (found) return String(found.id);
-  try {
-    const created = await prisma.folder.create({ data: where, select: { id: true } });
-    return String(created.id);
-  } catch (e) {
-    // Created by a parallel request in the meantime (unique index folders_user_parent_name).
-    if (!isUniqueViolation(e)) throw e;
-    const again = await prisma.folder.findFirst({ where: live, select: { id: true } });
-    if (!again) throw new Error("Could not create folder");
-    return String(again.id);
-  }
-}
-
-export async function folderExists(uid: string, id: string) {
-  const n = await prisma.folder.count({ where: { id: big(id), userId: big(uid), trashedAt: null } });
-  return n > 0;
 }

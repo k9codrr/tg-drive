@@ -9,7 +9,9 @@ import {
   STATE_COOKIE,
   userInfo,
 } from "@/lib/google";
+import { can } from "@/lib/rbac";
 import { requireUser } from "@/lib/session";
+import { teamRole } from "@/lib/space";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -34,13 +36,22 @@ export async function GET(req: NextRequest) {
       return back("gerror=Login%20expired%2C%20please%20try%20again");
     }
 
+    // "<uuid>.t<teamId>" = connecting a team account; check the user is still an admin there.
+    const teamMatch = /\.t(\d+)$/.exec(state);
+    const teamId = teamMatch ? big(teamMatch[1]) : null;
+    if (teamId) {
+      const m = await teamRole(uid, teamId);
+      if (!m || !can(m.role, "manageTeam")) return back("gerror=Only%20team%20admins%20can%20connect%20team%20storage");
+    }
+
     const tokens = await exchangeCode(code, origin);
     const profile = await userInfo(tokens.access_token);
     const email = profile.email.toLowerCase();
-    const key = { userId_email: { userId: big(uid), email } };
-    const existing = await prisma.googleAccount.findUnique({
-      where: key,
-      select: { refreshToken: true, rootFolderId: true },
+    // Private accounts are unique per (user, email), team accounts per (team, email).
+    const where = teamId ? { teamId, email } : { userId: big(uid), teamId: null, email };
+    const existing = await prisma.googleAccount.findFirst({
+      where,
+      select: { id: true, refreshToken: true, rootFolderId: true },
     });
 
     const refresh = tokens.refresh_token ?? (existing ? openString(existing.refreshToken) : null);
@@ -67,13 +78,10 @@ export async function GET(req: NextRequest) {
       quotaUpdatedAt: new Date(),
       needsReauth: false,
     };
-    await prisma.googleAccount.upsert({
-      where: key,
-      create: { userId: big(uid), email, ...fields },
-      update: fields,
-    });
+    if (existing) await prisma.googleAccount.update({ where: { id: existing.id }, data: fields });
+    else await prisma.googleAccount.create({ data: { userId: big(uid), teamId, email, ...fields } });
 
-    return back(`connected=${encodeURIComponent(email)}`);
+    return back(`connected=${encodeURIComponent(email)}${teamId ? `&team=${teamId}` : ""}`);
   } catch (e) {
     console.error(e);
     return back(`gerror=${encodeURIComponent(e instanceof Error ? e.message : "Google login failed")}`);

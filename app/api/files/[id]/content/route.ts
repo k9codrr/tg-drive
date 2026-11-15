@@ -7,6 +7,8 @@ import { big, prisma } from "@/lib/db";
 import { accessTokenFor, downloadRange } from "@/lib/google";
 import { fail, HttpError, parseId } from "@/lib/http";
 import { requireUser } from "@/lib/session";
+import { fileAccess } from "@/lib/space";
+import { asFileEnc, ctr, type FileEnc, requireKey } from "@/lib/filecrypt";
 import { readChunk } from "@/lib/store";
 
 export const runtime = "nodejs";
@@ -41,8 +43,10 @@ export async function GET(req: Request, { params }: Ctx) {
     const uid = await requireUser(req);
     const id = parseId((await params).id);
     if (!id) throw new HttpError(400, "Invalid id");
-    const file = await prisma.file.findFirst({
-      where: { id: big(id), userId: big(uid) },
+    // Opening in the viewer needs "view"; ?download=1 needs the right to download.
+    await fileAccess(uid, id, new URL(req.url).searchParams.get("download") === "1" ? "download" : "view");
+    const file = await prisma.file.findUnique({
+      where: { id: big(id) },
       select: {
         id: true,
         name: true,
@@ -54,9 +58,13 @@ export async function GET(req: Request, { params }: Ctx) {
         gdAccountId: true,
         gdFileId: true,
         updatedAt: true,
+        encryption: true,
       },
     });
     if (!file) throw new HttpError(404, "File not found");
+    // Encrypted: needs the unlock cookie (423 otherwise, before anything is streamed).
+    const enc = asFileEnc(file.encryption);
+    const crypt = enc ? { enc, key: requireKey(req, uid, id) } : null;
     if (file.status !== "ready") throw new HttpError(409, "This file hasn't finished uploading");
 
     const size = Number(file.size);
@@ -88,7 +96,7 @@ export async function GET(req: Request, { params }: Ctx) {
     if (range) headers["Content-Range"] = `bytes ${start}-${end}/${size}`;
     if (length === 0) return new Response(null, { status: range ? 206 : 200, headers });
 
-    const stream = streamBytes(file, start, end, req.signal);
+    const stream = streamBytes(file, start, end, req.signal, crypt);
     return new Response(stream, { status: range ? 206 : 200, headers });
   } catch (e) {
     return fail(e);
@@ -105,13 +113,24 @@ type Row = {
 };
 
 /** Streams bytes [start, end], fetching the next chunk while the current one is sent. */
-function streamBytes(file: Row, start: number, end: number, signal: AbortSignal): ReadableStream<Uint8Array> {
+function streamBytes(
+  file: Row,
+  start: number,
+  end: number,
+  signal: AbortSignal,
+  crypt: { enc: FileEnc; key: Buffer } | null,
+): ReadableStream<Uint8Array> {
   let pos = start;
   let token: string | null = null;
   const cs = file.backend === "gdrive" ? CHUNK_SIZE : file.chunkSize;
   let next: Promise<Buffer> | null = null;
 
+  // Every piece is decrypted at its own offset (CTR), so ranges and seeking work for encrypted files too.
   const fetchAt = async (p: number): Promise<Buffer> => {
+    const data = await fetchRaw(p);
+    return crypt ? ctr(crypt.key, crypt.enc, p, data) : data;
+  };
+  const fetchRaw = async (p: number): Promise<Buffer> => {
     if (file.backend === "gdrive") {
       if (!file.gdFileId || file.gdAccountId == null) throw new HttpError(404, "File not found in Google Drive");
       token ??= (await accessTokenFor(String(file.gdAccountId))).token;

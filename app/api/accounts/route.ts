@@ -2,24 +2,28 @@ import { NextResponse, type NextRequest } from "next/server";
 import { big, prisma } from "@/lib/db";
 import { googleConfigured, refreshStaleQuotas } from "@/lib/google";
 import { fail, HttpError } from "@/lib/http";
+import { listForUser, serverStore } from "@/lib/connections";
 import { r2Configured, r2Usage } from "@/lib/r2";
 import { requireUser } from "@/lib/session";
+import { parseExclude } from "@/lib/storage";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
 
-// GET /api/accounts[?refresh=1] → your storage pool: Telegram + Cloudflare R2 + each Google account
+// GET /api/accounts[?refresh=1] → your storage pool: the server's Telegram + R2, your Google accounts, Google
+// accounts your teams offer you, and storage connections (yours + offered by your teams)
 export async function GET(req: NextRequest) {
   try {
     const uid = await requireUser(req);
     const userId = big(uid);
     if (googleConfigured()) await refreshStaleQuotas(uid, req.nextUrl.searchParams.get("refresh") === "1");
 
-    const [user, accounts, usage, r2] = await Promise.all([
-      prisma.user.findUnique({ where: { id: userId }, select: { email: true, name: true, defaultStorage: true } }),
+    const memberOf = (await prisma.teamMember.findMany({ where: { userId }, select: { teamId: true } })).map((m) => m.teamId);
+    const [user, accounts, usage, r2, connections, offeredGoogle] = await Promise.all([
+      prisma.user.findUnique({ where: { id: userId }, select: { id: true, email: true, name: true, defaultStorage: true, mountStorage: true, uploadExclude: true } }),
       prisma.googleAccount.findMany({
-        where: { userId },
+        where: { userId, teamId: null },
         orderBy: { createdAt: "asc" },
         select: {
           id: true,
@@ -38,6 +42,13 @@ export async function GET(req: NextRequest) {
         _sum: { size: true },
       }),
       r2Configured() ? r2Usage(uid) : Promise.resolve(null),
+      listForUser(uid),
+      memberOf.length
+        ? prisma.googleAccount.findMany({
+            where: { teamId: { in: memberOf }, offerToMembers: true, needsReauth: false },
+            select: { id: true, email: true, quotaLimit: true, quotaUsage: true, team: { select: { name: true } } },
+          })
+        : Promise.resolve([]),
     ]);
     if (!user) throw new HttpError(401, "Account not found");
 
@@ -68,10 +79,27 @@ export async function GET(req: NextRequest) {
     const active = google.filter((g) => !g.needsReauth);
 
     return NextResponse.json({
-      user: { email: user.email, name: user.name ?? null },
+      user: { id: String(user.id), email: user.email, name: user.name ?? null },
       defaultStorage: user.defaultStorage,
+      mountStorage: user.mountStorage,
+      uploadExclude: parseExclude(user.uploadExclude),
       googleConfigured: googleConfigured(),
-      telegram: { configured: !!(process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_CHAT_ID), ...tg },
+      // "configured" = some Telegram storage is usable: the server's, your own bot, or one a team offers.
+      telegram: {
+        configured: !!serverStore("telegram") || [...connections.mine, ...connections.offered].some((c) => c.kind === "telegram"),
+        server: !!serverStore("telegram"),
+        ...tg,
+      },
+      connections,
+      offeredGoogle: offeredGoogle.map((g) => {
+        const limit = g.quotaLimit == null ? null : Number(g.quotaLimit);
+        return {
+          id: String(g.id),
+          email: g.email,
+          team: g.team?.name ?? null,
+          free: limit == null ? null : Math.max(0, limit - Number(g.quotaUsage)),
+        };
+      }),
       r2: r2 ? { configured: true, ...r2 } : { configured: false, used: 0, files: 0, limit: 0, free: 0 },
       google,
       totals: {

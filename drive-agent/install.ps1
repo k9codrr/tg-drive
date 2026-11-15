@@ -3,26 +3,46 @@
   Installs WinFsp + rclone, saves your device password, mounts TG Drive as T: now and at every login.
 
   Get the command (with your password filled in) from the web app: "PC drive" -> "Add this PC".
+  When the server is reachable over the internet (DAV_PUBLIC_URL is set), that command downloads this script
+  from the web app and passes -Source, so the PC doesn't need a copy of the repo:
+
+    powershell -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((irm https://drive.example.com/agent/install.ps1))) -Email you@example.com -Password tgd_xxx -Url https://dav.example.com/dav/ -Source https://drive.example.com/agent"
+
+  From a copy of the repo, on the PC that runs TG Drive:
 
     powershell -ExecutionPolicy Bypass -File drive-agent\install.ps1 -Email you@example.com -Password tgd_xxx
 
   Options:
     -Letter T          drive letter to use
     -CacheGB 10        max disk space the local cache may use
-    -Url <url>         WebDAV address (default: local server if it's running on this PC, else drive.xivago.com)
+    -Url <url>         WebDAV address (default: the local server, if it's running on this PC)
+    -Source <url>      download the agent scripts from here (<web app>/agent) into %LOCALAPPDATA%\TGDrive
 #>
 param(
   [Parameter(Mandatory = $true)][string]$Email,
   [Parameter(Mandatory = $true)][string]$Password,
   [string]$Letter = "T",
   [int]$CacheGB = 10,
-  [string]$Url = ""
+  [string]$Url = "",
+  [string]$Source = ""
 )
 $ErrorActionPreference = "Stop"
-$here = Split-Path -Parent $MyInvocation.MyCommand.Path
+$here = if ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } else { "" }
 $Letter = $Letter.TrimEnd(":").ToUpper()
 
 function Step($t) { Write-Host "`n==> $t" -ForegroundColor Cyan }
+
+# ---- 0. Agent scripts (when run from the web instead of a repo copy) ----
+if ($Source -or -not $here) {
+  if (-not $Source) { throw "Run this from the drive-agent folder, or pass -Source <web app>/agent." }
+  [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+  $here = Join-Path $env:LOCALAPPDATA "TGDrive"
+  New-Item -ItemType Directory -Force -Path $here | Out-Null
+  Step "Downloading the drive agent to $here"
+  foreach ($f in "mount.ps1", "tgd.ps1", "tgd.cmd") {
+    Invoke-WebRequest -UseBasicParsing -Uri "$($Source.TrimEnd('/'))/$f" -OutFile (Join-Path $here $f)
+  }
+}
 
 # ---- 1. WinFsp + rclone ----
 Step "Installing WinFsp and rclone (skipped if already installed)"
@@ -41,7 +61,8 @@ if (-not $Url) {
   $local = $false
   try { $local = (Test-NetConnection 127.0.0.1 -Port 3021 -WarningAction SilentlyContinue).TcpTestSucceeded } catch {}
   # On the PC that runs TG Drive, talk to it directly: faster, and no 100 MB Cloudflare upload limit.
-  $Url = if ($local) { "http://127.0.0.1:3021/dav" } else { "https://drive.xivago.com/dav" }
+  if (-not $local) { throw "TG Drive isn't running on this PC. Pass -Url with its WebDAV address (the web app's setup command includes it)." }
+  $Url = "http://127.0.0.1:3021/dav"
 }
 Step "Connecting to $Url"
 

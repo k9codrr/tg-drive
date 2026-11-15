@@ -160,9 +160,9 @@ export async function refreshQuota(id: string) {
 }
 
 /** Refresh quotas that are older than 5 minutes (or all, if force). Errors are swallowed. */
-export async function refreshStaleQuotas(uid: string, force = false) {
+export async function refreshStaleQuotas(uid: string, force = false, ids?: bigint[]) {
   const rows = await prisma.googleAccount.findMany({
-    where: { needsReauth: false, userId: big(uid) },
+    where: { needsReauth: false, ...(ids ? { id: { in: ids } } : { userId: big(uid), teamId: null }) },
     select: { id: true, quotaUpdatedAt: true },
   });
   const stale = rows.filter(
@@ -175,13 +175,42 @@ export function freeBytes(r: Pick<GoogleAccount, "quotaLimit" | "quotaUsage">) {
   return r.quotaLimit == null ? Number.POSITIVE_INFINITY : Number(r.quotaLimit) - Number(r.quotaUsage);
 }
 
-/** Choose the user's connected account with the most free space that fits `size`. */
-export async function pickAccount(uid: string, size: number, preferredId: string | null) {
-  await refreshStaleQuotas(uid);
-  const rows = await prisma.googleAccount.findMany({
-    where: { needsReauth: false, userId: big(uid) },
+/**
+ * Google accounts an upload may use, in groups by preference: in a team's folders the team's accounts,
+ * then your own, then accounts your teams offer to members; for your private files your own, then
+ * offered ones. (`teamId` = the team space being uploaded to, if any.)
+ */
+async function accountGroups(uid: string, teamId: bigint | null) {
+  const sel = { id: true, email: true, quotaLimit: true, quotaUsage: true } as const;
+  const memberOf = (await prisma.teamMember.findMany({ where: { userId: big(uid) }, select: { teamId: true } })).map((m) => m.teamId);
+  const [team, own, offered] = await Promise.all([
+    teamId ? prisma.googleAccount.findMany({ where: { needsReauth: false, teamId }, select: sel }) : Promise.resolve([]),
+    prisma.googleAccount.findMany({ where: { needsReauth: false, userId: big(uid), teamId: null }, select: sel }),
+    memberOf.length
+      ? prisma.googleAccount.findMany({ where: { needsReauth: false, teamId: { in: memberOf }, offerToMembers: true }, select: sel })
+      : Promise.resolve([]),
+  ]);
+  const seen = new Set<string>();
+  return [team, own, offered].map((g) => g.filter((r) => !seen.has(String(r.id)) && seen.add(String(r.id))));
+}
+
+/** Choose the account with the most free space that fits `size` (in the first group that has room). */
+export async function pickAccount(uid: string, size: number, preferredId: string | null, teamId: bigint | null = null) {
+  const groups = await accountGroups(uid, teamId);
+  const all = groups.flat();
+  await refreshStaleQuotas(uid, false, all.map((r) => r.id));
+  const fresh = await prisma.googleAccount.findMany({
+    where: { id: { in: all.map((r) => r.id) } },
     select: { id: true, email: true, quotaLimit: true, quotaUsage: true },
   });
+  type Acct = (typeof all)[number];
+  const latest = (r: Acct): Acct => fresh.find((f) => f.id === r.id) ?? r;
+  let rows = all.map(latest);
+  if (!preferredId) {
+    // First group with an account that fits; else fall through to the "not enough space" error below.
+    const group = groups.map((g) => g.map(latest)).find((g) => g.some((r) => freeBytes(r) >= size));
+    if (group) rows = group;
+  }
   const candidates = preferredId ? rows.filter((r) => String(r.id) === preferredId) : rows;
   if (!candidates.length) {
     throw new HttpError(400, preferredId ? "That Google account is not available" : "No Google account connected");

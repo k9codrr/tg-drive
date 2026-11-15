@@ -12,15 +12,19 @@ export async function GET(req: Request) {
   try {
     const uid = await requireUser(req);
     const [user, rows] = await Promise.all([
-      prisma.user.findUnique({ where: { id: big(uid) }, select: { email: true } }),
+      prisma.user.findUnique({ where: { id: big(uid) }, select: { email: true, mountStorage: true } }),
       prisma.deviceToken.findMany({
         where: { userId: big(uid) },
         orderBy: { createdAt: "desc" },
-        select: { id: true, name: true, createdAt: true, lastUsedAt: true },
+        select: { id: true, name: true, createdAt: true, lastUsedAt: true, storage: true, allowedIps: true, lastIp: true },
       }),
     ]);
     return NextResponse.json({
       email: user?.email ?? "",
+      mountStorage: user?.mountStorage ?? "same",
+      // Where other apps / machines connect (DAV_PUBLIC_URL, e.g. your tunnel's https address + /dav).
+      davUrl: process.env.DAV_PUBLIC_URL || null,
+      davOpen: !!process.env.DAV_HOST && !["127.0.0.1", "::1", "localhost"].includes(process.env.DAV_HOST),
       devices: rows.map((d) => ({ ...d, id: String(d.id) })),
     });
   } catch (e) {

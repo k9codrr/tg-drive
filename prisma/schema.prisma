@@ -19,11 +19,23 @@ model User {
   // Where new uploads go: "gdrive" (account with most free space, Telegram if none fits),
   // "gdrive:<accountId>", "telegram" or "r2".
   defaultStorage String @default("gdrive") @map("default_storage")
+  // Where the PC drive (T:) stores new files: "same" (= defaultStorage) or a target like defaultStorage.
+  mountStorage   String @default("same") @map("mount_storage")
+  // Comma-separated file/folder names that are never uploaded (browser or PC drive).
+  uploadExclude  String @default("node_modules,.next") @map("upload_exclude")
 
   folders        Folder[]
   files          File[]
   googleAccounts GoogleAccount[]
   deviceTokens   DeviceToken[]
+  memberships    TeamMember[]
+  notifications  Notification[]
+  teamsCreated   Team[]          @relation("TeamCreator")
+  invitesSent    TeamInvite[]    @relation("InviteSender")
+  sharesSent     Share[]         @relation("ShareSender")
+  connections    StorageConnection[]
+  identities     UserIdentity[]
+  sharesReceived Share[]         @relation("ShareRecipient")
 
   @@map("users")
 }
@@ -40,11 +52,15 @@ model Folder {
   trashedAt DateTime? @map("trashed_at") @db.Timestamptz(6)
   trashRoot Boolean   @default(false) @map("trash_root")
   starred   Boolean   @default(false)
+  // Set for folders in a team space (user_id = who created it); NULL = the user's private space.
+  teamId    BigInt?   @map("team_id")
 
   user     User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  team     Team?    @relation(fields: [teamId], references: [id], onDelete: Cascade)
   parent   Folder?  @relation("FolderTree", fields: [parentId], references: [id], onDelete: Cascade)
   children Folder[] @relation("FolderTree")
   files    File[]
+  shares   Share[]
 
   // A name must be unique per (user, parent) among folders not in the trash — including at the root,
   // where parent_id is NULL. Prisma can't express that (COALESCE + WHERE), so the partial unique index
@@ -66,11 +82,16 @@ model GoogleAccount {
   quotaUpdatedAt DateTime? @map("quota_updated_at") @db.Timestamptz(6)
   needsReauth    Boolean   @default(false) @map("needs_reauth")
   createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  // Set = a team's account (user_id = the admin who connected it); offered = members may use it privately.
+  teamId         BigInt?   @map("team_id")
+  offerToMembers Boolean   @default(false) @map("offer_to_members")
 
   user  User?  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  team  Team?  @relation(fields: [teamId], references: [id], onDelete: Cascade)
   files File[]
 
-  @@unique([userId, email], map: "google_accounts_user_email")
+  // Unique (user, email) among private accounts and (team, email) among team accounts: partial indexes
+  // created by hand in the migrations.
   @@map("google_accounts")
 }
 
@@ -98,11 +119,20 @@ model File {
   // then swapped in. transfer_lock stops two requests copying the same file at once.
   transferOf    BigInt?   @map("transfer_of")
   transferLock  DateTime? @map("transfer_lock") @db.Timestamptz(6)
+  // Set for files in a team space (user_id = who uploaded it); NULL = the user's private space.
+  teamId        BigInt?   @map("team_id")
+  // Password encryption of this file's bytes (lib/filecrypt.ts); NULL = not encrypted.
+  encryption    Json?
+  // Connection holding the chunks (NULL = the server's own Telegram / R2 from the environment).
+  connectionId  BigInt?   @map("connection_id")
 
   user      User?          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  team      Team?          @relation(fields: [teamId], references: [id], onDelete: Cascade)
   folder    Folder?        @relation(fields: [folderId], references: [id], onDelete: Cascade)
   gdAccount GoogleAccount? @relation(fields: [gdAccountId], references: [id], onDelete: Restrict)
+  connection StorageConnection? @relation(fields: [connectionId], references: [id], onDelete: Restrict)
   chunks    Chunk[]
+  shares    Share[]
   original  File?          @relation("Transfer", fields: [transferOf], references: [id], onDelete: Cascade)
   copies    File[]         @relation("Transfer")
 
@@ -136,9 +166,147 @@ model DeviceToken {
   tokenHash  String    @unique @map("token_hash")
   createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
   lastUsedAt DateTime? @map("last_used_at") @db.Timestamptz(6)
+  // Overrides the account's mountStorage for this PC (NULL = use the account setting).
+  storage    String?
+  // Only these addresses may use this device password ("1.2.3.4, 10.0.0.0/8"; NULL = any), and the last one seen.
+  allowedIps String?   @map("allowed_ips")
+  lastIp     String?   @map("last_ip")
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
   @@map("device_tokens")
+}
+
+// ---------- Teams (RBAC) ----------
+
+model Team {
+  id        BigInt   @id @default(autoincrement())
+  name      String
+  createdBy BigInt?  @map("created_by")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  // Team sync: SSO users with a verified email at this domain join automatically with ssoRole.
+  ssoDomain String?  @map("sso_domain")
+  ssoRole   String   @default("member") @map("sso_role")
+
+  creator User?        @relation("TeamCreator", fields: [createdBy], references: [id], onDelete: SetNull)
+  members TeamMember[]
+  invites TeamInvite[]
+  folders Folder[]
+  files   File[]
+  connections    StorageConnection[]
+  googleAccounts GoogleAccount[]
+
+  @@map("teams")
+}
+
+// role: owner | admin | manager | member | viewer (see lib/rbac.ts)
+model TeamMember {
+  teamId    BigInt   @map("team_id")
+  userId    BigInt   @map("user_id")
+  role      String
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([teamId, userId])
+  @@index([userId], map: "team_members_user")
+  @@map("team_members")
+}
+
+model TeamInvite {
+  id        BigInt   @id @default(autoincrement())
+  teamId    BigInt   @map("team_id")
+  email     String
+  role      String
+  invitedBy BigInt?  @map("invited_by")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  team    Team  @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  inviter User? @relation("InviteSender", fields: [invitedBy], references: [id], onDelete: SetNull)
+
+  @@unique([teamId, email], map: "team_invites_team_email")
+  @@index([email], map: "team_invites_email")
+  @@map("team_invites")
+}
+
+// In-app notifications (team invites, role changes, and later: shares).
+model Notification {
+  id        BigInt    @id @default(autoincrement())
+  userId    BigInt    @map("user_id")
+  kind      String
+  title     String
+  body      String?
+  data      Json?
+  readAt    DateTime? @map("read_at") @db.Timestamptz(6)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt(sort: Desc)], map: "notifications_user")
+  @@map("notifications")
+}
+
+// One file or folder shared with one person (see lib/shares.ts). Exactly one of fileId/folderId is set.
+model Share {
+  id             BigInt    @id @default(autoincrement())
+  fileId         BigInt?   @map("file_id")
+  folderId       BigInt?   @map("folder_id")
+  sharedBy       BigInt?   @map("shared_by")
+  sharedWith     BigInt    @map("shared_with")
+  permission     String // view | download | edit | full
+  passwordHash   String?   @map("password_hash")
+  passwordSealed String?   @map("password_sealed")
+  unlockedUntil  DateTime? @map("unlocked_until") @db.Timestamptz(6)
+  expiresAt      DateTime? @map("expires_at") @db.Timestamptz(6)
+  // For an encrypted file: its key wrapped with this share's password.
+  keyWrap        Json?     @map("key_wrap")
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  file      File?   @relation(fields: [fileId], references: [id], onDelete: Cascade)
+  folder    Folder? @relation(fields: [folderId], references: [id], onDelete: Cascade)
+  sender    User?   @relation("ShareSender", fields: [sharedBy], references: [id], onDelete: SetNull)
+  recipient User    @relation("ShareRecipient", fields: [sharedWith], references: [id], onDelete: Cascade)
+
+  @@index([sharedWith], map: "shares_with")
+  @@map("shares")
+}
+
+// Storage someone connected: a Telegram bot, an S3-compatible bucket or a WebDAV server (lib/connections.ts).
+model StorageConnection {
+  id             BigInt    @id @default(autoincrement())
+  kind           String // telegram | s3 | webdav
+  name           String
+  userId         BigInt?   @map("user_id")
+  teamId         BigInt?   @map("team_id")
+  offerToMembers Boolean   @default(false) @map("offer_to_members")
+  config         String // sealed JSON with the credentials
+  summary        String    @default("")
+  limitBytes     BigInt?   @map("limit_bytes")
+  lastError      String?   @map("last_error")
+  checkedAt      DateTime? @map("checked_at") @db.Timestamptz(6)
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user  User?  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  team  Team?  @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  files File[]
+
+  @@map("storage_connections")
+}
+
+// A single-sign-on identity (provider + its stable user id) linked to a user (lib/sso.ts).
+model UserIdentity {
+  provider    String
+  subject     String
+  userId      BigInt    @map("user_id")
+  email       String?
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  lastLoginAt DateTime? @map("last_login_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([provider, subject])
+  @@index([userId], map: "user_identities_user")
+  @@map("user_identities")
 }

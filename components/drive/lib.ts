@@ -1,6 +1,15 @@
 // Client-side data helpers for the drive UI: API calls, chunked upload/download, file kinds.
 
-export type Folder = { id: string; name: string; createdAt: string; starred?: boolean; trashedAt?: string | null; parentId?: string | null };
+export type Folder = {
+  id: string;
+  name: string;
+  createdAt: string;
+  starred?: boolean;
+  trashedAt?: string | null;
+  parentId?: string | null;
+  ownerId?: string | null; // who created it (team spaces)
+  share?: ShareInfo; // in "Shared with me"
+};
 export type FileItem = {
   id: string;
   name: string;
@@ -13,6 +22,20 @@ export type FileItem = {
   account: string | null;
   starred?: boolean;
   trashedAt?: string | null;
+  ownerId?: string | null; // who uploaded it
+  addedBy?: string | null; // their name, in team spaces
+  share?: ShareInfo; // in "Shared with me"
+  encrypted?: boolean; // password-encrypted (needs unlocking to open)
+};
+/** A share you received, as shown in "Shared with me". */
+export type ShareInfo = {
+  id: string;
+  permission: "view" | "download" | "edit" | "full";
+  by: string;
+  expiresAt: string | null;
+  locked: boolean;
+  hasPassword: boolean;
+  password: string | null;
 };
 export type GoogleAccount = {
   id: string;
@@ -25,16 +48,46 @@ export type GoogleAccount = {
   app: { files: number; bytes: number };
 };
 export type Pool = {
-  user: { email: string; name: string | null };
+  user: { id: string; email: string; name: string | null };
   defaultStorage: string;
+  mountStorage: string; // "same" = follow defaultStorage
+  uploadExclude: string[]; // names never uploaded, e.g. node_modules
   r2: { configured: boolean; used: number; files: number; limit: number; free: number };
   googleConfigured: boolean;
-  telegram: { configured: boolean; files: number; bytes: number };
+  telegram: { configured: boolean; server?: boolean; files: number; bytes: number };
+  connections?: { mine: Connection[]; offered: Connection[] };
+  offeredGoogle?: { id: string; email: string; team: string | null; free: number | null }[];
   google: GoogleAccount[];
   totals: { googleLimit: number; googleUsed: number; googleFree: number; unlimitedGoogle: boolean; storedByApp: number };
 };
+export type SpaceInfo =
+  | { id: string; name: string; role: "owner" | "admin" | "manager" | "member" | "viewer"; shared?: undefined }
+  | {
+      shared: { permission: "view" | "download" | "edit" | "full"; by: string; rootKind: "file" | "folder"; rootId: string };
+      id?: undefined;
+      name?: undefined;
+      role?: undefined;
+    }
+  | null;
+/** Storage someone connected (Telegram bot / S3 bucket / WebDAV folder), as listed by /api/connections. */
+export type Connection = {
+  id: string;
+  kind: "telegram" | "s3" | "webdav";
+  name: string;
+  summary: string;
+  teamId: string | null;
+  teamName: string | null;
+  offerToMembers: boolean;
+  limit: number | null;
+  used: number;
+  files: number;
+  lastError: string | null;
+  checkedAt: string | null;
+  createdAt: string;
+};
 export type Listing = {
   folderId: string | null;
+  space?: SpaceInfo;
   breadcrumbs: { id: string; name: string }[];
   folders: Folder[];
   files: FileItem[];
@@ -43,7 +96,39 @@ export type Listing = {
 export type Pending = { file: File; dir: string }; // dir = relative folder path ("" = current folder)
 
 const PARALLEL_CHUNKS = 2;
+// No request may hang forever: a stalled one is aborted and retried (chunks) or reported (others).
+const API_TIMEOUT_MS = 60_000;
+const CHUNK_TIMEOUT_MS = 180_000;
 export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** A signal that fires on `outer` abort or after `ms`; `timedOut()` tells which. */
+function timeoutSignal(ms: number, outer?: AbortSignal | null) {
+  const ctl = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    ctl.abort();
+  }, ms);
+  const onAbort = () => ctl.abort();
+  if (outer) {
+    if (outer.aborted) ctl.abort();
+    else outer.addEventListener("abort", onAbort, { once: true });
+  }
+  return {
+    signal: ctl.signal,
+    timedOut: () => timedOut,
+    done: () => {
+      clearTimeout(timer);
+      outer?.removeEventListener("abort", onAbort);
+    },
+  };
+}
+
+/** Names that are never uploaded (case-insensitive), e.g. node_modules. */
+export function excludedBy(list: string[]) {
+  const set = new Set(list.map((x) => x.toLowerCase()));
+  return (name: string) => set.has(name.toLowerCase());
+}
 export const msg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 export function formatBytes(n: number) {
@@ -70,7 +155,8 @@ export function formatDate(iso: string) {
 }
 
 export class ApiError extends Error {
-  constructor(public status: number, message: string) {
+  /** `data` = the rest of the error body, e.g. { locked: true, shareId } for a password-protected share. */
+  constructor(public status: number, message: string, public data: Record<string, unknown> = {}) {
     super(message);
   }
 }
@@ -80,14 +166,23 @@ export async function api<T>(url: string, init?: RequestInit): Promise<T> {
   const isGet = !init?.method || init.method === "GET";
   for (let attempt = 0; ; attempt++) {
     let res: Response;
+    const t = timeoutSignal(API_TIMEOUT_MS, init?.signal);
     try {
-      res = await fetch(url, { ...init, headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) } });
+      res = await fetch(url, {
+        ...init,
+        signal: t.signal,
+        headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
+      });
     } catch {
+      if (init?.signal?.aborted) throw new ApiError(0, "Cancelled");
       if (isGet && attempt < 2) {
         await sleep(800 * (attempt + 1));
         continue;
       }
+      if (t.timedOut()) throw new ApiError(0, "The server took too long to answer. Try again.");
       throw new ApiError(0, navigator.onLine ? "Can't reach the server. Check that TG Drive is running." : "You're offline.");
+    } finally {
+      t.done();
     }
     if (res.status === 401) {
       window.location.href = "/login";
@@ -105,7 +200,7 @@ export async function api<T>(url: string, init?: RequestInit): Promise<T> {
           : res.status === 404
             ? "That item no longer exists."
             : `Something went wrong (HTTP ${res.status}).`;
-      throw new ApiError(res.status, data.error || fallback);
+      throw new ApiError(res.status, data.error || fallback, data);
     }
     return data as T;
   }
@@ -117,12 +212,15 @@ async function putChunk(id: string, idx: number, blob: Blob, signal?: AbortSigna
   for (let attempt = 0; attempt < 8; attempt++) {
     if (signal?.aborted) throw new Error("Cancelled");
     let res: Response;
+    const t = timeoutSignal(CHUNK_TIMEOUT_MS, signal);
     try {
-      res = await fetch(`/api/files/${id}/chunks/${idx}`, { method: "PUT", body: blob, signal });
+      res = await fetch(`/api/files/${id}/chunks/${idx}`, { method: "PUT", body: blob, signal: t.signal });
     } catch {
       if (signal?.aborted) throw new Error("Cancelled");
-      await sleep(2000 * (attempt + 1)); // network blip
+      await sleep(2000 * (attempt + 1)); // network blip or a stalled request (timed out)
       continue;
+    } finally {
+      t.done();
     }
     if (res.ok) return;
     const data = await res.json().catch(() => ({}));
@@ -149,6 +247,8 @@ export async function uploadFile(
   dest: string,
   onProgress: (bytes: number) => void,
   signal?: AbortSignal,
+  team: string | null = null, // only used at the top of a team (no folder)
+  encryptPassword: string | null = null, // encrypt with this password (the server unlocks it for the upload)
 ) {
   const init = await api<{ id: string; chunkSize: number; chunkCount: number; sequential: boolean }>("/api/files", {
     method: "POST",
@@ -157,8 +257,11 @@ export async function uploadFile(
       size: file.size,
       mime: file.type || mimeFromName(file.name),
       folderId,
+      team,
       target: dest,
+      ...(encryptPassword ? { encryption: { password: encryptPassword } } : {}),
     }),
+    signal,
   });
   let next = 0;
   let uploaded = 0;
@@ -176,7 +279,7 @@ export async function uploadFile(
     await Promise.all(
       Array.from({ length: Math.min(init.sequential ? 1 : PARALLEL_CHUNKS, init.chunkCount) }, worker),
     );
-    await api(`/api/files/${init.id}/complete`, { method: "POST" });
+    await api(`/api/files/${init.id}/complete`, { method: "POST", signal });
   } catch (e) {
     // Don't leave a half-uploaded file behind.
     await fetch(`/api/files/${init.id}`, { method: "DELETE" }).catch(() => {});
@@ -200,6 +303,8 @@ export async function downloadFile(file: { id: string }, onProgress: (pct: numbe
       }
       if (res?.ok) break;
       const data = res ? await res.clone().json().catch(() => ({})) : {};
+      // Locked (encrypted / password share), not allowed, or gone: retrying won't help.
+      if (res && [403, 404, 423].includes(res.status)) throw new Error(data.error || `Download failed (HTTP ${res.status})`);
       await sleep(res?.status === 429 ? (Number(data.retryAfter) || 5) * 1000 : 1500 * (attempt + 1));
     }
     if (!res || !res.ok) throw new Error(`Couldn't download part ${i + 1} of ${meta.chunkCount}. Try again.`);
@@ -237,8 +342,15 @@ export async function fetchBytes(id: string, maxBytes?: number, signal?: AbortSi
   return res.arrayBuffer();
 }
 
-/** Reads dropped files AND folders (recursively), keeping relative paths. */
-export function collectDropped(dt: DataTransfer): Promise<Pending[]> {
+/**
+ * Reads dropped files AND folders (recursively), keeping relative paths. Folders/files whose name is
+ * excluded (node_modules, .next, …) are not even opened; `skipped` counts them.
+ */
+export function collectDropped(
+  dt: DataTransfer,
+  exclude: string[] = [],
+): Promise<{ items: Pending[]; skipped: number }> {
+  const isExcluded = excludedBy(exclude);
   // webkitGetAsEntry must be called synchronously inside the drop event
   const entries = Array.from(dt.items)
     .filter((it) => it.kind === "file")
@@ -247,9 +359,17 @@ export function collectDropped(dt: DataTransfer): Promise<Pending[]> {
   const plainFiles = Array.from(dt.files);
 
   return (async () => {
-    if (!entries.length) return plainFiles.map((file) => ({ file, dir: "" }));
+    let skipped = 0;
+    if (!entries.length) {
+      const items = plainFiles.filter((f) => !isExcluded(f.name)).map((file) => ({ file, dir: "" }));
+      return { items, skipped: plainFiles.length - items.length };
+    }
     const out: Pending[] = [];
     const walk = async (entry: FileSystemEntry, dir: string): Promise<void> => {
+      if (isExcluded(entry.name)) {
+        skipped++;
+        return;
+      }
       if (entry.isFile) {
         const file = await new Promise<File>((res, rej) => (entry as FileSystemFileEntry).file(res, rej));
         out.push({ file, dir });
@@ -264,7 +384,7 @@ export function collectDropped(dt: DataTransfer): Promise<Pending[]> {
       }
     };
     for (const e of entries) await walk(e, "");
-    return out;
+    return { items: out, skipped };
   })();
 }
 
@@ -370,6 +490,7 @@ export const mimeOf = (f: { mime: string; name: string }) =>
 
 /** Whether the browser can show an image thumbnail directly. */
 export const canThumb = (f: FileItem) =>
+  !f.encrypted &&
   f.status === "ready" &&
   f.size > 0 &&
   f.size <= 20 * 1024 * 1024 &&

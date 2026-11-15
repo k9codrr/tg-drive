@@ -48,7 +48,7 @@ function Loading({ label = "Loading preview…" }: { label?: string }) {
   );
 }
 
-function Failed({ error, retry, file, onDownload }: { error: string; retry?: () => void; file: FileItem; onDownload: () => void }) {
+function Failed({ error, retry, file, onDownload }: { error: string; retry?: () => void; file: FileItem; onDownload?: () => void }) {
   return (
     <div className="viewerMsg" role="alert">
       <KindIcon kind={kindOf(file.mime, file.name)} size={44} />
@@ -60,15 +60,17 @@ function Failed({ error, retry, file, onDownload }: { error: string; retry?: () 
             <RotateCw size={16} aria-hidden /> Try again
           </button>
         )}
-        <button className="btn primary" onClick={onDownload}>
-          <Download size={16} aria-hidden /> Download
-        </button>
+        {onDownload && (
+          <button className="btn primary" onClick={onDownload}>
+            <Download size={16} aria-hidden /> Download
+          </button>
+        )}
       </div>
     </div>
   );
 }
 
-function NoPreview({ file, onDownload, reason }: { file: FileItem; onDownload: () => void; reason?: string }) {
+function NoPreview({ file, onDownload, reason }: { file: FileItem; onDownload?: () => void; reason?: string }) {
   return (
     <div className="viewerMsg">
       <KindIcon kind={kindOf(file.mime, file.name)} size={56} />
@@ -76,9 +78,11 @@ function NoPreview({ file, onDownload, reason }: { file: FileItem; onDownload: (
       <span className="muted">
         {reason ?? `${KIND_LABEL[kindOf(file.mime, file.name)]} files can't be previewed here.`} {formatBytes(file.size)}
       </span>
-      <button className="btn primary" onClick={onDownload}>
-        <Download size={16} aria-hidden /> Download
-      </button>
+      {onDownload && (
+        <button className="btn primary" onClick={onDownload}>
+          <Download size={16} aria-hidden /> Download
+        </button>
+      )}
     </div>
   );
 }
@@ -127,7 +131,7 @@ function MediaView({ file, kind, onError }: { file: FileItem; kind: "video" | "a
   );
 }
 
-function TextView({ file, onDownload }: { file: FileItem; onDownload: () => void }) {
+function TextView({ file, onDownload }: { file: FileItem; onDownload?: () => void }) {
   const { state, retry } = useLoad(file.id, async (signal) => {
     const buf = await fetchBytes(file.id, file.size > LIMIT.text ? LIMIT.text : undefined, signal);
     let text = new TextDecoder("utf-8", { fatal: false }).decode(buf);
@@ -162,7 +166,7 @@ function tooBig(file: FileItem, limit: number) {
   return file.size > limit ? `This file is ${formatBytes(file.size)}. Previews work up to ${formatBytes(limit)}.` : null;
 }
 
-function SheetView({ file, onDownload }: { file: FileItem; onDownload: () => void }) {
+function SheetView({ file, onDownload }: { file: FileItem; onDownload?: () => void }) {
   const [active, setActive] = useState(0);
   const { state, retry } = useLoad(file.id, async (signal) => {
     const XLSX = await import("xlsx");
@@ -228,7 +232,7 @@ const DOC_CSS = `body{font:15px/1.6 system-ui,-apple-system,"Segoe UI",Roboto,sa
 img{max-width:100%;height:auto}table{border-collapse:collapse;margin:12px 0}td,th{border:1px solid #d0d7de;padding:4px 8px}
 h1,h2,h3{line-height:1.25}a{color:#0969da}p{margin:0 0 .8em}`;
 
-function DocView({ file, onDownload }: { file: FileItem; onDownload: () => void }) {
+function DocView({ file, onDownload }: { file: FileItem; onDownload?: () => void }) {
   const ext = extOf(file.name);
   const { state, retry } = useLoad(file.id, async (signal) => {
     if (ext !== "docx") throw new Error("Only .docx Word files can be previewed.");
@@ -247,7 +251,7 @@ function DocView({ file, onDownload }: { file: FileItem; onDownload: () => void 
   return <iframe className="docFrame" sandbox="" srcDoc={html} title={file.name} />;
 }
 
-function SlidesView({ file, onDownload }: { file: FileItem; onDownload: () => void }) {
+function SlidesView({ file, onDownload }: { file: FileItem; onDownload?: () => void }) {
   const ext = extOf(file.name);
   const { state, retry } = useLoad(file.id, async (signal) => {
     if (ext !== "pptx") throw new Error("Only .pptx files can be previewed.");
@@ -299,7 +303,7 @@ function SlidesView({ file, onDownload }: { file: FileItem; onDownload: () => vo
   );
 }
 
-function ArchiveView({ file, onDownload }: { file: FileItem; onDownload: () => void }) {
+function ArchiveView({ file, onDownload }: { file: FileItem; onDownload?: () => void }) {
   const ext = extOf(file.name);
   const { state, retry } = useLoad(file.id, async (signal) => {
     if (ext !== "zip") throw new Error("Only .zip archives can be previewed.");
@@ -338,7 +342,7 @@ function ArchiveView({ file, onDownload }: { file: FileItem; onDownload: () => v
   );
 }
 
-function FontView({ file, onDownload }: { file: FileItem; onDownload: () => void }) {
+function FontView({ file, onDownload }: { file: FileItem; onDownload?: () => void }) {
   const family = `tgd-preview-${file.id}`;
   const { state, retry } = useLoad(file.id, async (signal) => {
     const buf = await fetchBytes(file.id, undefined, signal);
@@ -376,7 +380,8 @@ export default function Preview({
   index: number;
   onIndex: (i: number) => void;
   onClose: () => void;
-  onDownload: (f: FileItem) => void;
+  /** Left out when you may only view (e.g. a "View" share): no download buttons. */
+  onDownload?: (f: FileItem) => void;
 }) {
   const file = files[index];
   const [mediaError, setMediaError] = useState<string | null>(null);
@@ -416,7 +421,7 @@ export default function Preview({
   }, [go, onClose]);
 
   if (!file) return null;
-  const download = () => onDownload(file);
+  const download = onDownload ? () => onDownload(file) : undefined;
 
   let body: React.ReactNode;
   if (file.status !== "ready") {
@@ -468,9 +473,11 @@ export default function Preview({
             {index + 1} / {files.length}
           </span>
         )}
-        <button className="btn viewerDl" onClick={download} disabled={file.status !== "ready"}>
-          <Download size={16} aria-hidden /> <span>Download</span>
-        </button>
+        {download && (
+          <button className="btn viewerDl" onClick={download} disabled={file.status !== "ready"}>
+            <Download size={16} aria-hidden /> <span>Download</span>
+          </button>
+        )}
       </header>
       <div className="viewerBody" onClick={(e) => e.target === e.currentTarget && onClose()}>
         {body}

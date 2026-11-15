@@ -1,6 +1,7 @@
 // Path ⇄ database mapping for the WebDAV drive. A path is a list of names under the user's root.
 import type { Prisma } from "@prisma/client";
 import { big, prisma } from "../db";
+import { personal } from "../space";
 import { trashFiles, trashFolder } from "../trash";
 
 export const fileSelect = {
@@ -15,6 +16,7 @@ export const fileSelect = {
   gdFileId: true,
   createdAt: true,
   updatedAt: true,
+  encryption: true, // password-encrypted files can't be read on the PC drive
 } satisfies Prisma.FileSelect;
 
 export type FileNode = { kind: "file" } & Prisma.FileGetPayload<{ select: typeof fileSelect }>;
@@ -43,7 +45,7 @@ export async function folderIdFor(uid: string, segs: string[]): Promise<bigint |
       continue;
     }
     const f: { id: bigint } | null = await prisma.folder.findFirst({
-      where: { userId: big(uid), parentId: parent, name: segs[i], trashedAt: null },
+      where: { userId: big(uid), teamId: null, parentId: parent, name: segs[i], trashedAt: null },
       select: { id: true },
     });
     if (!f) return undefined;
@@ -60,12 +62,12 @@ export async function resolve(uid: string, segs: string[]): Promise<Node | null>
   if (parent === undefined) return null;
   const name = segs[segs.length - 1];
   const folder = await prisma.folder.findFirst({
-    where: { userId: big(uid), parentId: parent, name, trashedAt: null },
+    where: { userId: big(uid), teamId: null, parentId: parent, name, trashedAt: null },
     select: { id: true, name: true, createdAt: true, updatedAt: true },
   });
   if (folder) return { kind: "folder", ...folder };
   const file = await prisma.file.findFirst({
-    where: { userId: big(uid), folderId: parent, name, status: "ready", trashedAt: null, transferOf: null },
+    where: { userId: big(uid), teamId: null, folderId: parent, name, status: "ready", trashedAt: null, transferOf: null },
     orderBy: { createdAt: "desc" },
     select: fileSelect,
   });
@@ -76,11 +78,11 @@ export async function resolve(uid: string, segs: string[]): Promise<Node | null>
 export async function children(uid: string, folderId: bigint | null): Promise<Node[]> {
   const [folders, files] = await Promise.all([
     prisma.folder.findMany({
-      where: { userId: big(uid), parentId: folderId, trashedAt: null },
+      where: { userId: big(uid), teamId: null, parentId: folderId, trashedAt: null },
       select: { id: true, name: true, createdAt: true, updatedAt: true },
     }),
     prisma.file.findMany({
-      where: { userId: big(uid), folderId, status: "ready", trashedAt: null, transferOf: null },
+      where: { userId: big(uid), teamId: null, folderId, status: "ready", trashedAt: null, transferOf: null },
       orderBy: { createdAt: "desc" },
       select: fileSelect,
     }),
@@ -102,17 +104,17 @@ export async function children(uid: string, folderId: bigint | null): Promise<No
 export async function deleteNode(uid: string, parentId: bigint | null, node: Node) {
   if (node.kind === "file") {
     const same = await prisma.file.findMany({
-      where: { userId: big(uid), folderId: parentId, name: node.name, trashedAt: null, transferOf: null },
+      where: { userId: big(uid), teamId: null, folderId: parentId, name: node.name, trashedAt: null, transferOf: null },
       select: { id: true },
     });
     await trashFiles(
-      uid,
+      personal(uid),
       same.map((f) => f.id),
     );
     return;
   }
   if (node.id == null) throw new Error("Cannot delete the root");
-  await trashFolder(uid, node.id);
+  await trashFolder(personal(uid), node.id);
 }
 
 /** True if `folderId` is `ancestorId` or somewhere inside it. */

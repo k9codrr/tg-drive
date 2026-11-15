@@ -3,6 +3,7 @@ import { isUniqueViolation, prisma } from "@/lib/db";
 import { fail, HttpError, readJson } from "@/lib/http";
 import { hashPassword } from "@/lib/password";
 import { setSession, signupPolicy } from "@/lib/session";
+import { passwordLoginEnabled } from "@/lib/sso";
 
 export const runtime = "nodejs";
 
@@ -14,6 +15,7 @@ export async function POST(req: Request) {
     if (!process.env.SESSION_SECRET) throw new HttpError(500, "Server not configured: set SESSION_SECRET");
     const policy = signupPolicy();
     if (!policy.allowed) throw new HttpError(403, "Sign-ups are closed");
+    if (!passwordLoginEnabled()) throw new HttpError(403, "Accounts are created by signing in with single sign-on");
 
     const body = await readJson(req);
     if (policy.needsCode && body.code !== process.env.SIGNUP_CODE) {

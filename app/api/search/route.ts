@@ -1,8 +1,9 @@
 import type { Prisma } from "@prisma/client";
 import { NextResponse, type NextRequest } from "next/server";
-import { big, fileOut, fileOutSelect, prisma } from "@/lib/db";
+import { fileOut, fileOutSelect, prisma } from "@/lib/db";
 import { fail } from "@/lib/http";
 import { requireUser } from "@/lib/session";
+import { spaceFor, spaceWhere } from "@/lib/space";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -35,7 +36,7 @@ function typeFilter(type: string): Prisma.FileWhereInput | null {
 // GET /api/search?q=report        → your files whose name contains the text (any folder)
 // GET /api/search?type=image      → all images (also video | audio | document), newest first
 // GET /api/search?recent=1        → your most recently added files
-// q and type can be combined.
+// q and type can be combined. &team=<id> searches that team instead of your private space.
 export async function GET(req: NextRequest) {
   try {
     const uid = await requireUser(req);
@@ -45,7 +46,8 @@ export async function GET(req: NextRequest) {
     const recent = sp.get("recent") === "1";
     if (!q && !type && !recent) return NextResponse.json({ files: [] });
 
-    const where: Prisma.FileWhereInput = { userId: big(uid), trashedAt: null, transferOf: null, AND: [] };
+    const space = await spaceFor(uid, sp.get("team"));
+    const where: Prisma.FileWhereInput = { ...spaceWhere(space), trashedAt: null, transferOf: null, AND: [] };
     const and = where.AND as Prisma.FileWhereInput[];
     if (q) and.push({ name: { contains: q, mode: "insensitive" } });
     if (type) and.push(type);

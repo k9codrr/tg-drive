@@ -3,6 +3,8 @@ import { big, prisma } from "@/lib/db";
 import { accessTokenFor, downloadRange, putResumable, queryResumable } from "@/lib/google";
 import { fail, HttpError, parseId } from "@/lib/http";
 import { requireUser } from "@/lib/session";
+import { fileAccess } from "@/lib/space";
+import { asFileEnc, ctr, requireKey } from "@/lib/filecrypt";
 import { readChunk, storeChunk } from "@/lib/store";
 
 export const runtime = "nodejs";
@@ -19,9 +21,11 @@ async function parse(params: Ctx["params"]) {
   return { id, idx };
 }
 
-async function loadFile(uid: string, id: string) {
-  const file = await prisma.file.findFirst({
-    where: { id: big(id), userId: big(uid) },
+/** Reading needs download rights; writing needs upload rights, and only while the file is uploading. */
+async function loadFile(uid: string, id: string, mode: "read" | "write") {
+  await fileAccess(uid, id, mode === "write" ? "upload" : "download");
+  const file = await prisma.file.findUnique({
+    where: { id: big(id) },
     select: {
       size: true,
       chunkSize: true,
@@ -32,6 +36,7 @@ async function loadFile(uid: string, id: string) {
       gdFileId: true,
       gdUploadUrl: true,
       uploadedBytes: true,
+      encryption: true,
     },
   });
   if (!file) throw new HttpError(404, "File not found");
@@ -55,10 +60,14 @@ export async function PUT(req: Request, { params }: Ctx) {
   try {
     const uid = await requireUser(req);
     const { id, idx } = await parse(params);
-    const file = await loadFile(uid, id);
+    const file = await loadFile(uid, id, "write");
     const { size, start, length } = chunkBounds(file, idx);
+    if (file.status !== "uploading" && file.backend !== "gdrive") {
+      const existing = await prisma.chunk.count({ where: { fileId: big(id), idx } });
+      if (!existing) throw new HttpError(409, "This file is already finished");
+    }
 
-    if (file.backend === "gdrive") return await putDriveChunk(req, id, file, start, length, size);
+    if (file.backend === "gdrive") return await putDriveChunk(req, uid, id, file, start, length, size);
 
     const fileId = big(id);
     const existing = await prisma.chunk.count({ where: { fileId, idx } });
@@ -69,14 +78,20 @@ export async function PUT(req: Request, { params }: Ctx) {
       throw new HttpError(400, `Chunk size mismatch (got ${raw.byteLength}, expected ${length})`);
     }
 
-    await storeChunk(uid, fileId, idx, file.backend === "r2" ? "r2" : "telegram", raw);
+    await storeChunk(uid, fileId, idx, file.backend === "r2" ? "r2" : "telegram", sealed(req, uid, id, file, start, raw));
     return NextResponse.json({ ok: true });
   } catch (e) {
     return fail(e);
   }
 }
 
-async function putDriveChunk(req: Request, id: string, file: FileRow, start: number, length: number, size: number) {
+/** Encrypted files: the bytes at `offset`, encrypted with the file's key (from the unlock cookie). */
+function sealed(req: Request, uid: string, id: string, file: FileRow, offset: number, raw: Buffer) {
+  const enc = asFileEnc(file.encryption);
+  return enc ? ctr(requireKey(req, uid, id), enc, offset, raw) : raw;
+}
+
+async function putDriveChunk(req: Request, uid: string, id: string, file: FileRow, start: number, length: number, size: number) {
   const uploaded = Number(file.uploadedBytes);
   if (file.status === "ready" || start + length <= uploaded) {
     return NextResponse.json({ ok: true, skipped: true }); // already stored (retry)
@@ -84,10 +99,11 @@ async function putDriveChunk(req: Request, id: string, file: FileRow, start: num
   if (start !== uploaded) throw new HttpError(409, "Drive chunks must be uploaded in order");
   if (!file.gdUploadUrl) throw new HttpError(409, "Upload session missing — start the upload again");
 
-  const raw = Buffer.from(await req.arrayBuffer());
-  if (raw.byteLength !== length) {
-    throw new HttpError(400, `Chunk size mismatch (got ${raw.byteLength}, expected ${length})`);
+  const plain = Buffer.from(await req.arrayBuffer());
+  if (plain.byteLength !== length) {
+    throw new HttpError(400, `Chunk size mismatch (got ${plain.byteLength}, expected ${length})`);
   }
+  const raw = sealed(req, uid, id, file, start, plain);
 
   const url = file.gdUploadUrl;
   let result;
@@ -117,7 +133,7 @@ export async function GET(req: Request, { params }: Ctx) {
     const { id, idx } = await parse(params);
     let out: Buffer;
 
-    const file = await loadFile(uid, id);
+    const file = await loadFile(uid, id, "read");
     if (file.backend === "gdrive") {
       if (!file.gdFileId || file.gdAccountId == null) throw new HttpError(404, "File not found in Drive");
       const { start, length } = chunkBounds(file, idx);
@@ -129,6 +145,9 @@ export async function GET(req: Request, { params }: Ctx) {
       out = data;
     }
 
+    // CTR works the same in both directions: this decrypts.
+    const { start: offset } = chunkBounds(file, idx);
+    out = sealed(req, uid, id, file, offset, out);
     return new Response(new Uint8Array(out), {
       headers: {
         "Content-Type": "application/octet-stream",

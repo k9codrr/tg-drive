@@ -35,10 +35,16 @@ import {
   Search,
   Star,
   StarOff,
+  Share2,
+  Lock,
+  LockOpen,
+  KeyRound,
   Trash2,
   Undo2,
   ArrowRightLeft,
   Upload,
+  UserPlus,
+  Users,
   WifiOff,
   X,
   type LucideIcon,
@@ -54,14 +60,21 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
 } from "react";
+import { can, type Role, ROLE_INFO, SHARE_INFO, shareAllows, type SharePerm } from "../lib/rbac";
+import ConnectionsPanel from "./Connections";
 import DevicesModal from "./Devices";
+import NotificationsBell from "./Notifications";
+import ShareDialog, { SetPasswordDialog, UnlockDialog } from "./Share";
+import TeamsModal, { type TeamSummary } from "./Teams";
 import { FileTypeIcon, KindIcon, KindTile } from "./drive/icons";
 import {
   api,
+  ApiError,
   canThumb,
   collectDropped,
   contentUrl,
   downloadFile,
+  excludedBy,
   formatBytes,
   formatDate,
   kindOf,
@@ -72,9 +85,11 @@ import {
   type Listing,
   type Pending,
   type Pool,
+  type ShareInfo,
   uploadFile,
 } from "./drive/lib";
 import Preview from "./drive/Preview";
+import { StorageOptions, storageLabel } from "./drive/storage";
 import { applyPrefs, DESIGN_INFO, loadPrefs, savePrefs, type Prefs } from "./drive/theme";
 import ThemePicker from "./drive/ThemePicker";
 import { ConfirmDialog, IconButton, Menu, Modal, PromptDialog, Toasts, type MenuAnchor, type MenuItem, type Toast } from "./drive/ui";
@@ -84,13 +99,16 @@ export { formatBytes } from "./drive/lib";
 // ---------- types ----------
 
 type KindView = "image" | "video" | "audio" | "document";
-type View =
+// `team` = the space being browsed: null/undefined = My Drive (private), else a team id.
+type View = (
   | { type: "folder"; id: string | null }
   | { type: "recent" }
   | { type: "starred" }
   | { type: "trash" }
+  | { type: "shared" } // "Shared with me" (always outside any team)
   | { type: "kind"; kind: KindView }
-  | { type: "search"; q: string };
+  | { type: "search"; q: string }
+) & { team?: string | null };
 type Results = { folders: Folder[]; files: FileItem[] };
 type Entry =
   | { key: string; type: "folder"; id: string; name: string; date: string; size: -1; folder: Folder }
@@ -100,7 +118,8 @@ type Sort = { key: SortKey; dir: 1 | -1 };
 type Filter = "all" | "folders" | "image" | "video" | "audio" | "document";
 type JobStatus = "queued" | "uploading" | "done" | "error" | "cancelled";
 type Job = { key: string; label: string; name: string; size: number; done: number; status: JobStatus; error?: string };
-type Batch = { items: Pending[]; keys: string[]; target: string | null; dest: string };
+// `encrypt` = password to encrypt these uploads with (kept in memory only, for retries).
+type Batch = { items: Pending[]; keys: string[]; target: string | null; dest: string; team: string | null; encrypt?: string };
 type Dialog =
   | { kind: "newFolder" }
   | { kind: "rename"; entry: Entry }
@@ -109,6 +128,12 @@ type Dialog =
   | { kind: "storage"; entries: Entry[] }
   | { kind: "forever"; entries: Entry[] }
   | { kind: "emptyTrash" }
+  | { kind: "share"; entry: Entry; max: SharePerm | null }
+  | { kind: "encUpload" }
+  | { kind: "encrypt"; file: FileItem }
+  | { kind: "changePw"; file: FileItem }
+  | { kind: "unlockFile"; file: FileItem; then: () => void }
+  | { kind: "unlock"; shareId: string; name?: string; then: () => void }
   | null;
 
 const KIND_VIEWS: { kind: KindView; label: string; icon: LucideIcon }[] = [
@@ -130,23 +155,29 @@ const PAGE = 300;
 
 function readView(): View {
   const p = new URLSearchParams(window.location.search);
+  const team = p.get("t");
   const q = p.get("q");
-  if (q) return { type: "search", q };
+  if (q) return { type: "search", q, team };
   const v = p.get("view");
-  if (v === "recent") return { type: "recent" };
-  if (v === "starred") return { type: "starred" };
-  if (v === "trash") return { type: "trash" };
-  if (v === "image" || v === "video" || v === "audio" || v === "document") return { type: "kind", kind: v };
-  return { type: "folder", id: p.get("f") };
+  if (v === "recent") return { type: "recent", team };
+  if (v === "starred") return { type: "starred", team };
+  if (v === "trash") return { type: "trash", team };
+  if (v === "shared") return { type: "shared", team: null };
+  if (v === "image" || v === "video" || v === "audio" || v === "document") return { type: "kind", kind: v, team };
+  return { type: "folder", id: p.get("f"), team };
 }
 function viewUrl(v: View) {
-  if (v.type === "search") return `/?q=${encodeURIComponent(v.q)}`;
-  if (v.type === "recent") return "/?view=recent";
-  if (v.type === "starred") return "/?view=starred";
-  if (v.type === "trash") return "/?view=trash";
-  if (v.type === "kind") return `/?view=${v.kind}`;
-  return v.id ? `/?f=${v.id}` : "/";
+  const p = new URLSearchParams();
+  if (v.team) p.set("t", v.team);
+  if (v.type === "search") p.set("q", v.q);
+  else if (v.type === "kind") p.set("view", v.kind);
+  else if (v.type !== "folder") p.set("view", v.type);
+  else if (v.id) p.set("f", v.id);
+  const qs = p.toString();
+  return qs ? `/?${qs}` : "/";
 }
+/** `team=` query parameter for API calls in this view's space. */
+const teamQs = (v: View) => `team=${v.team ?? ""}`;
 const sameView = (a: View, b: View) => viewUrl(a) === viewUrl(b);
 
 function store<T>(key: string, fallback: T): T {
@@ -208,6 +239,9 @@ export default function Drive() {
   const [pool, setPool] = useState<Pool | null>(null);
   const [showStorage, setShowStorage] = useState(false);
   const [showDevices, setShowDevices] = useState(false);
+  const [showTeams, setShowTeams] = useState(false);
+  const [teams, setTeams] = useState<TeamSummary[]>([]);
+  const [inviteCount, setInviteCount] = useState(0);
   const [sideOpen, setSideOpen] = useState(false);
   const [dest, setDest] = useState("gdrive");
   const [offline, setOffline] = useState(false);
@@ -218,7 +252,9 @@ export default function Drive() {
   const viewRef = useRef(view);
   viewRef.current = view;
   const queue = useRef<Batch[]>([]);
-  const pendingByKey = useRef(new Map<string, { item: Pending; target: string | null; dest: string }>());
+  const pendingByKey = useRef(
+    new Map<string, { item: Pending; target: string | null; dest: string; team: string | null; encrypt?: string }>(),
+  );
   const aborts = useRef(new Map<string, AbortController>());
   const cancelled = useRef(new Set<string>());
   const running = useRef(false);
@@ -228,6 +264,35 @@ export default function Drive() {
   const loadSeq = useRef(0);
 
   const design = prefs?.design ?? "nimbus";
+  const currentTeam = view.team ? (teams.find((t) => t.id === view.team) ?? null) : null;
+  const role: Role | null = currentTeam ? currentTeam.role : view.team ? (listing?.space?.role ?? "viewer") : null;
+  // Inside a folder someone shared with you, the share's permission decides instead of a role.
+  const sharedPerm: SharePerm | null = view.type === "folder" ? (listing?.space?.shared?.permission ?? null) : null;
+  const allowed = (a: Parameters<typeof can>[1]) =>
+    sharedPerm ? shareAllows(sharedPerm, a) : view.type === "shared" ? false : role == null || can(role, a);
+  const shareOf = (e: Entry): ShareInfo | undefined => (e.type === "folder" ? e.folder.share : e.file.share);
+  const myId = pool?.user.id ?? null;
+  const isMine = (e: Entry) => (e.type === "folder" ? e.folder.ownerId : e.file.ownerId) === myId;
+  // In "Shared with me" the items are the shared roots themselves: changing them needs Full access.
+  const canEdit = (e: Entry) => {
+    const sh = shareOf(e);
+    if (sh) return sh.permission === "full";
+    return allowed(isMine(e) ? "editOwn" : "editAny");
+  };
+  const canDownloadFile = (f: FileItem) => (f.share ? shareAllows(f.share.permission, "download") : allowed("download"));
+  const canShare = (e: Entry) => {
+    const sh = shareOf(e);
+    if (sh) return sh.permission === "full";
+    if (sharedPerm) return shareAllows(sharedPerm, "share");
+    if (!view.team) return true;
+    return allowed(isMine(e) ? "share" : "editAny");
+  };
+  const shareCap = (e: Entry): SharePerm | null => shareOf(e)?.permission ?? sharedPerm;
+  const canDeleteForever = (e: Entry) => allowed(isMine(e) ? "editOwn" : "deleteForever");
+  const canUpload = allowed("upload");
+  const rootName = sharedPerm
+    ? "Shared with me"
+    : (currentTeam?.name ?? (view.team ? (listing?.space?.name ?? "Team") : "My Drive"));
   const folderId = view.type === "folder" ? view.id : null;
 
   // ----- toasts -----
@@ -296,20 +361,43 @@ export default function Drive() {
     if (!quiet) setLoading(true);
     try {
       if (v.type === "folder") {
-        const d = await api<Listing>(`/api/list?folder=${v.id ?? ""}`);
+        const d = await api<Listing>(`/api/list?folder=${v.id ?? ""}&${teamQs(v)}`);
         if (seq !== loadSeq.current) return;
         setListing(d);
         setTotals(d.stats);
         setResults(null);
+      } else if (v.type === "shared") {
+        type Received = ShareInfo & {
+          sharedAt: string;
+          file: (Omit<FileItem, "folderId" | "account" | "share">) | null;
+          folder: { id: string; name: string; createdAt: string } | null;
+        };
+        const r = await api<{ shares: Received[] }>("/api/shares/received");
+        if (seq !== loadSeq.current) return;
+        const info = (x: Received): ShareInfo => ({
+          id: x.id,
+          permission: x.permission,
+          by: x.by,
+          expiresAt: x.expiresAt,
+          locked: x.locked,
+          hasPassword: x.hasPassword,
+          password: x.password,
+        });
+        setResults({
+          folders: r.shares.filter((x) => x.folder).map((x) => ({ ...x.folder!, createdAt: x.sharedAt, share: info(x) })),
+          files: r.shares
+            .filter((x) => x.file)
+            .map((x) => ({ ...x.file!, folderId: null, account: null, createdAt: x.sharedAt, share: info(x) })),
+        });
       } else if (v.type === "starred" || v.type === "trash") {
-        const r = await api<Results & { days?: number }>(`/api/${v.type}`);
+        const r = await api<Results & { days?: number }>(`/api/${v.type}?${teamQs(v)}`);
         if (seq !== loadSeq.current) return;
         setResults({ folders: r.folders, files: r.files });
         if (r.days) setTrashDays(r.days);
       } else {
         const qs =
           v.type === "recent" ? "recent=1" : v.type === "kind" ? `type=${v.kind}` : `q=${encodeURIComponent(v.q)}`;
-        const r = await api<{ files: FileItem[] }>(`/api/search?${qs}`);
+        const r = await api<{ files: FileItem[] }>(`/api/search?${qs}&${teamQs(v)}`);
         if (seq !== loadSeq.current) return;
         setResults({ folders: [], files: r.files });
       }
@@ -317,6 +405,10 @@ export default function Drive() {
     } catch (e) {
       if (seq !== loadSeq.current) return;
       setLoadError(msg(e));
+      // A password-protected share: ask for the password, then load again.
+      if (e instanceof ApiError && e.status === 423 && typeof e.data.shareId === "string") {
+        setDialog({ kind: "unlock", shareId: e.data.shareId, then: () => void load(v) });
+      }
     } finally {
       if (seq === loadSeq.current) setLoading(false);
     }
@@ -329,6 +421,19 @@ export default function Drive() {
     setFilter("all");
     void load(view);
   }, [view, mounted, load]);
+
+  const loadTeams = useCallback(async () => {
+    try {
+      const r = await api<{ teams: TeamSummary[]; invites: unknown[] }>("/api/teams");
+      setTeams(r.teams);
+      setInviteCount(r.invites.length);
+    } catch {
+      /* the sidebar just shows no teams */
+    }
+  }, []);
+  useEffect(() => {
+    if (mounted) void loadTeams();
+  }, [mounted, loadTeams]);
 
   const loadPool = useCallback(
     async (refresh = false) => {
@@ -389,6 +494,7 @@ export default function Drive() {
 
   const navigate = useCallback((v: View) => {
     setSideOpen(false);
+    if (v.team === undefined) v = { ...v, team: viewRef.current.team ?? null };
     if (v.type !== "search") setQuery("");
     if (sameView(v, viewRef.current)) return void load(v);
     setView(v);
@@ -407,7 +513,7 @@ export default function Drive() {
     const t = setTimeout(() => {
       if (q) {
         if (viewRef.current.type !== "search" || viewRef.current.q !== q) {
-          const v: View = { type: "search", q };
+          const v: View = { type: "search", q, team: viewRef.current.team ?? null };
           const replace = viewRef.current.type === "search";
           setView(v);
           window.history[replace ? "replaceState" : "pushState"](null, "", viewUrl(v));
@@ -484,42 +590,57 @@ export default function Drive() {
   // ----- uploads -----
   const patchJob = (key: string, patch: Partial<Job>) => setJobs((js) => js.map((j) => (j.key === key ? { ...j, ...patch } : j)));
 
+  // Files upload a few at a time, each on its own: a slow or failing file never holds up the others.
+  // A failed file is marked with its error (and a Retry button) and the queue moves on.
+  const PARALLEL_FILES = 3;
   const runQueue = async () => {
     if (running.current) return;
     running.current = true;
     try {
       while (queue.current.length) {
         const batch = queue.current.shift()!;
-        const dirCache = new Map<string, string | null>([["", batch.target]]);
-        for (let i = 0; i < batch.items.length; i++) {
-          const { file, dir } = batch.items[i];
-          const key = batch.keys[i];
-          if (cancelled.current.has(key)) continue;
-          patchJob(key, { status: "uploading", done: 0, error: undefined });
-          const ctl = new AbortController();
-          aborts.current.set(key, ctl);
-          try {
-            let parent = dirCache.get(dir);
-            if (parent === undefined) {
-              const r = await api<{ id: string }>("/api/folders", {
-                method: "POST",
-                body: JSON.stringify({ parentId: batch.target, path: dir }),
-              });
-              parent = r.id;
-              dirCache.set(dir, parent);
-            }
-            await uploadFile(file, parent, batch.dest, (n) => patchJob(key, { done: n }), ctl.signal);
-            patchJob(key, { status: "done", done: file.size });
-            pendingByKey.current.delete(key);
-          } catch (e) {
-            if (cancelled.current.has(key)) patchJob(key, { status: "cancelled" });
-            else patchJob(key, { status: "error", error: msg(e) });
-          } finally {
-            aborts.current.delete(key);
+        // Folder chains are created once per batch; parallel files in the same folder share the request.
+        const dirCache = new Map<string, Promise<string | null>>([["", Promise.resolve(batch.target)]]);
+        const folderFor = (dir: string) => {
+          let p = dirCache.get(dir);
+          if (!p) {
+            p = api<{ id: string }>("/api/folders", {
+              method: "POST",
+              body: JSON.stringify({ parentId: batch.target, path: dir, team: batch.team }),
+            }).then((r) => r.id);
+            // Don't cache a failure: the next file in that folder tries again.
+            p.catch(() => dirCache.delete(dir));
+            dirCache.set(dir, p);
           }
-          const v = viewRef.current;
-          if (batch.items.length <= 20 && v.type === "folder" && v.id === batch.target) void load(v, true);
-        }
+          return p;
+        };
+        let next = 0;
+        const worker = async () => {
+          for (;;) {
+            const i = next++;
+            if (i >= batch.items.length) return;
+            const { file, dir } = batch.items[i];
+            const key = batch.keys[i];
+            if (cancelled.current.has(key)) continue;
+            patchJob(key, { status: "uploading", done: 0, error: undefined });
+            const ctl = new AbortController();
+            aborts.current.set(key, ctl);
+            try {
+              const parent = await folderFor(dir);
+              await uploadFile(file, parent, batch.dest, (n) => patchJob(key, { done: n }), ctl.signal, batch.team, batch.encrypt ?? null);
+              patchJob(key, { status: "done", done: file.size });
+              pendingByKey.current.delete(key);
+            } catch (e) {
+              if (cancelled.current.has(key)) patchJob(key, { status: "cancelled" });
+              else patchJob(key, { status: "error", error: msg(e) });
+            } finally {
+              aborts.current.delete(key);
+            }
+            const v = viewRef.current;
+            if (batch.items.length <= 20 && v.type === "folder" && v.id === batch.target) void load(v, true);
+          }
+        };
+        await Promise.all(Array.from({ length: Math.min(PARALLEL_FILES, batch.items.length) }, worker));
         void load(viewRef.current, true);
         void loadPool();
       }
@@ -528,7 +649,7 @@ export default function Drive() {
     }
   };
 
-  const enqueue = (items: Pending[], target: string | null = folderId) => {
+  const enqueue = (items: Pending[], target: string | null = folderId, encrypt?: string) => {
     if (!items.length) return;
     const stamp = Date.now();
     const newJobs: Job[] = items.map((p, i) => ({
@@ -539,23 +660,25 @@ export default function Drive() {
       done: 0,
       status: "queued",
     }));
-    newJobs.forEach((j, i) => pendingByKey.current.set(j.key, { item: items[i], target, dest: "default" }));
-    queue.current.push({ items, keys: newJobs.map((j) => j.key), target, dest: "default" });
+    const team = viewRef.current.team ?? null;
+    newJobs.forEach((j, i) => pendingByKey.current.set(j.key, { item: items[i], target, dest: "default", team, encrypt }));
+    queue.current.push({ items, keys: newJobs.map((j) => j.key), target, dest: "default", team, encrypt });
     setJobs((js) => [...js.filter((j) => j.status !== "cancelled"), ...newJobs]);
     setUploadsOpen(true);
     void runQueue();
   };
 
   const retryJobs = (keys: string[]) => {
-    const groups = new Map<string, { items: Pending[]; keys: string[]; target: string | null; dest: string }>();
+    const groups = new Map<string, Batch>();
     for (const k of keys) {
       const p = pendingByKey.current.get(k);
       if (!p) continue;
       cancelled.current.delete(k);
-      const g = groups.get(`${p.target}|${p.dest}`) ?? { items: [], keys: [], target: p.target, dest: p.dest };
+      const gk = `${p.target}|${p.dest}|${p.team}|${p.encrypt ?? ""}`;
+      const g = groups.get(gk) ?? { items: [], keys: [], target: p.target, dest: p.dest, team: p.team, encrypt: p.encrypt };
       g.items.push(p.item);
       g.keys.push(k);
-      groups.set(`${p.target}|${p.dest}`, g);
+      groups.set(gk, g);
     }
     for (const g of groups.values()) queue.current.push(g);
     setJobs((js) => js.map((j) => (keys.includes(j.key) ? { ...j, status: "queued", error: undefined, done: 0 } : j)));
@@ -582,28 +705,48 @@ export default function Drive() {
     return () => window.removeEventListener("beforeunload", h);
   }, [activeJobs.length]);
 
+  const encInput = useRef<HTMLInputElement>(null);
+  const encPassword = useRef<string | null>(null);
+  const onPickEncrypted = (e: ChangeEvent<HTMLInputElement>) => {
+    const list = Array.from(e.target.files ?? []);
+    e.target.value = "";
+    const pw = encPassword.current;
+    encPassword.current = null;
+    if (pw && list.length) enqueue(list.map((file) => ({ file, dir: "" })), folderId, pw);
+  };
   const onPickFiles = (e: ChangeEvent<HTMLInputElement>) => {
     const list = Array.from(e.target.files ?? []);
     e.target.value = "";
     enqueue(list.map((file) => ({ file, dir: "" })));
   };
+  const excludeList = pool?.uploadExclude ?? ["node_modules", ".next"];
+  const reportSkipped = (n: number) => {
+    if (n) toast("info", `Skipped ${n} item${n === 1 ? "" : "s"} you never upload (${excludeList.join(", ")}).`);
+  };
   const onPickFolder = (e: ChangeEvent<HTMLInputElement>) => {
     const list = Array.from(e.target.files ?? []);
     e.target.value = "";
-    enqueue(
-      list.map((file) => {
-        const parts = (file.webkitRelativePath || file.name).split("/");
-        parts.pop();
-        return { file, dir: parts.join("/") };
-      }),
-    );
+    const isExcluded = excludedBy(excludeList);
+    const items: Pending[] = [];
+    let skipped = 0;
+    for (const file of list) {
+      const parts = (file.webkitRelativePath || file.name).split("/");
+      if (parts.some(isExcluded)) {
+        skipped++;
+        continue;
+      }
+      parts.pop();
+      items.push({ file, dir: parts.join("/") });
+    }
+    reportSkipped(skipped);
+    enqueue(items);
   };
 
   // ----- drag & drop (upload from the PC, or move files onto a folder) -----
   const INTERNAL = "application/x-tgd-files";
   const hasFiles = (e: DragEvent) => Array.from(e.dataTransfer.types).includes("Files");
   const isInternal = (e: DragEvent) => Array.from(e.dataTransfer.types).includes(INTERNAL);
-  const canUploadHere = view.type === "folder";
+  const canUploadHere = view.type === "folder" && canUpload;
 
   const onDragEnter = (e: DragEvent) => {
     if (!hasFiles(e) || isInternal(e) || !canUploadHere) return;
@@ -625,8 +768,11 @@ export default function Drive() {
     dragDepth.current = 0;
     setDragging(false);
     const target = folderId;
-    collectDropped(e.dataTransfer)
-      .then((items) => enqueue(items, target))
+    collectDropped(e.dataTransfer, excludeList)
+      .then(({ items, skipped }) => {
+        reportSkipped(skipped);
+        enqueue(items, target);
+      })
       .catch(fail);
   };
 
@@ -677,7 +823,61 @@ export default function Drive() {
     void load(viewRef.current, true);
   };
 
+  /** Runs `then` once an encrypted file is unlocked in this browser (asks for the password if needed). */
+  const withUnlocked = async (f: FileItem, then: () => void) => {
+    if (!f.encrypted) return then();
+    try {
+      const meta = await api<{ unlocked: boolean }>(`/api/files/${f.id}`);
+      if (meta.unlocked) return then();
+    } catch (e) {
+      return fail(e);
+    }
+    setDialog({ kind: "unlockFile", file: f, then });
+  };
+  const lockFile = async (f: FileItem) => {
+    await api(`/api/files/${f.id}/unlock`, { method: "DELETE" }).catch(fail);
+    toast("success", `Locked “${f.name}” in this browser.`);
+  };
+
+  /** Encrypt a plain file / remove a file's encryption: rewrites its bytes, in steps, like a storage move. */
+  const recrypt = async (f: FileItem, encryption: { mode: "encrypt"; password: string } | { mode: "decrypt" }) => {
+    const verb = encryption.mode === "encrypt" ? "Encrypting" : "Decrypting";
+    const t = toast("progress", `${verb} ${f.name}…`);
+    try {
+      for (let attempt = 0; ; ) {
+        try {
+          const r = await api<{ done: boolean; copied: number; size: number }>(`/api/files/${f.id}/transfer`, {
+            method: "POST",
+            body: JSON.stringify({ encryption }),
+          });
+          patchToast(t, { text: `${verb} ${f.name}`, progress: Math.round((r.copied / Math.max(1, r.size)) * 100) });
+          if (r.done) break;
+          attempt = 0;
+        } catch (e) {
+          // Network blips and busy storage: retry a few times; real errors (wrong state, no rights) stop.
+          if (!(e instanceof ApiError) || e.status === 0 || e.status >= 500 || e.status === 429) {
+            if (++attempt > 4) throw e;
+            await new Promise((r) => setTimeout(r, 2000 * attempt));
+            continue;
+          }
+          throw e;
+        }
+      }
+      dismiss(t);
+      toast("success", encryption.mode === "encrypt" ? `Encrypted “${f.name}”.` : `Removed encryption from “${f.name}”.`);
+      void load(viewRef.current, true);
+    } catch (e) {
+      dismiss(t);
+      toast("error", `${f.name}: ${msg(e)}`, { action: { label: "Retry", run: () => void recrypt(f, encryption) } });
+    }
+  };
+
   const download = async (files: FileItem[]) => {
+    const locked = files.find((f) => f.encrypted && f.status === "ready");
+    if (locked && files.length === 1) return withUnlocked(locked, () => void downloadReady(files));
+    return downloadReady(files);
+  };
+  const downloadReady = async (files: FileItem[]) => {
     const ready = files.filter((f) => f.status === "ready");
     if (!ready.length) return toast("error", "Those files haven't finished uploading yet.");
     for (const f of ready) {
@@ -770,6 +970,7 @@ export default function Drive() {
         method: "POST",
         body: JSON.stringify({
           target,
+          team: viewRef.current.team ?? null,
           files: list.filter((e) => e.type === "file").map((e) => e.id),
           folders: list.filter((e) => e.type === "folder").map((e) => e.id),
         }),
@@ -840,10 +1041,16 @@ export default function Drive() {
   };
 
   const open = (e: Entry) => {
+    const sh = shareOf(e);
+    if (sh?.locked) {
+      return setDialog({ kind: "unlock", shareId: sh.id, name: e.name, then: () => void load(viewRef.current, true).then(() => open({ ...e, ...(e.type === "folder" ? { folder: { ...e.folder, share: { ...sh, locked: false } } } : { file: { ...e.file, share: { ...sh, locked: false } } }) } as Entry)) });
+    }
     if (e.type === "folder" && view.type === "trash") return toast("info", "Restore this folder to open it.");
-    if (e.type === "folder") return openFolder(e.id);
+    if (e.type === "folder") return navigate(sh ? { type: "folder", id: e.id, team: null } : { type: "folder", id: e.id });
     const i = visibleFiles.findIndex((f) => f.id === e.id);
-    setPreview({ files: visibleFiles, index: Math.max(0, i) });
+    const show = () => setPreview({ files: visibleFiles, index: Math.max(0, i) });
+    if (e.type === "file" && e.file.encrypted) return void withUnlocked(e.file, show);
+    show();
   };
 
   // ----- selection -----
@@ -891,39 +1098,84 @@ export default function Drive() {
     const files = targets.filter((x): x is Extract<Entry, { type: "file" }> => x.type === "file").map((x) => x.file);
     if (view.type === "trash")
       return [
-        { label: many ? `Restore ${plural(targets.length)}` : "Restore", icon: Undo2, onSelect: () => void restore(targets).catch(fail) },
+        { label: many ? `Restore ${plural(targets.length)}` : "Restore", icon: Undo2, onSelect: () => void restore(targets).catch(fail), disabled: !targets.every(canEdit) },
         ...(!many && e.type === "file" ? [{ label: "Preview", icon: Eye, onSelect: () => open(e) } as MenuItem] : []),
         "separator",
-        { label: "Delete forever", icon: Trash2, danger: true, onSelect: () => setDialog({ kind: "forever", entries: targets }), shortcut: "Del" },
+        { label: "Delete forever", icon: Trash2, danger: true, onSelect: () => setDialog({ kind: "forever", entries: targets }), shortcut: "Del", disabled: !targets.every(canDeleteForever) },
       ];
     const allStarred = targets.every(isStarred);
     const starItem: MenuItem = {
       label: allStarred ? "Remove from Starred" : "Add to Starred",
       icon: allStarred ? StarOff : Star,
       onSelect: () => void setStar(targets, !allStarred),
+      disabled: !canUpload,
     };
-    const storageItem: MenuItem = { label: "Change storage…", icon: ArrowRightLeft, onSelect: () => setDialog({ kind: "storage", entries: targets }) };
+    const storageItem: MenuItem = {
+      label: "Change storage…",
+      icon: ArrowRightLeft,
+      onSelect: () => setDialog({ kind: "storage", entries: targets }),
+      disabled: !allowed("moveStorage"),
+    };
+    const inShare = !!sharedPerm || view.type === "shared";
+    if (inShare) starItem.disabled = true; // stars belong to the owner
+    const editable = targets.every(canEdit);
     if (many)
       return [
-        { label: `Download ${files.length} file${files.length === 1 ? "" : "s"}`, icon: Download, onSelect: () => void download(files), disabled: !files.length },
-        { label: "Move to…", icon: FolderInput, onSelect: () => setDialog({ kind: "move", files }), disabled: !files.length || targets.some((t) => t.type === "folder") },
+        { label: `Download ${files.length} file${files.length === 1 ? "" : "s"}`, icon: Download, onSelect: () => void download(files), disabled: !files.length || !files.every(canDownloadFile) },
+        { label: "Move to…", icon: FolderInput, onSelect: () => setDialog({ kind: "move", files }), disabled: !files.length || targets.some((t) => t.type === "folder") || !editable || inShare },
         starItem,
         storageItem,
         "separator",
-        { label: `Move ${targets.length} items to trash`, icon: Trash2, danger: true, onSelect: () => void moveToTrash(targets), shortcut: "Del" },
+        { label: `Move ${targets.length} items to trash`, icon: Trash2, danger: true, onSelect: () => void moveToTrash(targets), shortcut: "Del", disabled: !editable },
       ];
     const items: MenuItem[] = [
       { label: e.type === "folder" ? "Open" : "Preview", icon: e.type === "folder" ? FolderOpen : Eye, onSelect: () => open(e), shortcut: "Enter" },
     ];
     if (e.type === "file") {
-      items.push({ label: "Download", icon: Download, onSelect: () => void download([e.file]), disabled: e.file.status !== "ready" });
-      if (view.type !== "folder")
+      items.push({ label: "Download", icon: Download, onSelect: () => void download([e.file]), disabled: e.file.status !== "ready" || !canDownloadFile(e.file) });
+      if (view.type !== "folder" && view.type !== "shared")
         items.push({ label: "Show in folder", icon: FolderOpen, onSelect: () => openFolder(e.file.folderId) });
     }
-    items.push("separator", { label: "Rename", icon: Pencil, onSelect: () => setDialog({ kind: "rename", entry: e }), shortcut: "F2" });
-    if (e.type === "file") items.push({ label: "Move to…", icon: FolderInput, onSelect: () => setDialog({ kind: "move", files: [e.file] }) });
+    items.push("separator", { label: "Rename", icon: Pencil, onSelect: () => setDialog({ kind: "rename", entry: e }), shortcut: "F2", disabled: !editable });
+    if (e.type === "file") items.push({ label: "Move to…", icon: FolderInput, onSelect: () => setDialog({ kind: "move", files: [e.file] }), disabled: !editable || inShare });
+    items.push({ label: "Share…", icon: Share2, onSelect: () => setDialog({ kind: "share", entry: e, max: shareCap(e) }), disabled: !canShare(e) });
+    if (e.type === "file" && e.file.status === "ready") {
+      const f = e.file;
+      if (!f.encrypted) {
+        items.push({ label: "Encrypt with password…", icon: Lock, onSelect: () => setDialog({ kind: "encrypt", file: f }), disabled: !editable });
+      } else {
+        items.push(
+          { label: "Change password…", icon: KeyRound, onSelect: () => void withUnlocked(f, () => setDialog({ kind: "changePw", file: f })), disabled: !editable },
+          {
+            label: "Remove encryption",
+            icon: LockOpen,
+            onSelect: () =>
+              void withUnlocked(f, () => {
+                if (window.confirm(`Store “${f.name}” unencrypted? Anyone with access to it will be able to open it without a password.`)) {
+                  void recrypt(f, { mode: "decrypt" });
+                }
+              }),
+            disabled: !editable,
+          },
+          { label: "Lock now", icon: Lock, onSelect: () => void lockFile(f) },
+        );
+      }
+    }
+    if (view.type === "shared" && shareOf(e)) {
+      const sh = shareOf(e)!;
+      items.push("separator", {
+        label: "Remove from Shared with me",
+        icon: Trash2,
+        danger: true,
+        onSelect: () =>
+          void api(`/api/shares/${sh.id}`, { method: "DELETE" })
+            .then(() => load(viewRef.current, true))
+            .catch(fail),
+      });
+      return items;
+    }
     items.push(starItem, storageItem);
-    items.push("separator", { label: "Move to trash", icon: Trash2, danger: true, onSelect: () => void moveToTrash([e]), shortcut: "Del" });
+    items.push("separator", { label: "Move to trash", icon: Trash2, danger: true, onSelect: () => void moveToTrash([e]), shortcut: "Del", disabled: !editable });
     return items;
   };
   const showMenu = (e: Entry, anchor: MenuAnchor) => {
@@ -947,10 +1199,11 @@ export default function Drive() {
     setMenu({
       anchor: { x: alignRight ? r.right : r.left, y: r.bottom + 6, alignRight },
       items: [
-        { label: "New folder", icon: FolderPlus, onSelect: () => setDialog({ kind: "newFolder" }) },
+        { label: "New folder", icon: FolderPlus, onSelect: () => setDialog({ kind: "newFolder" }), disabled: !canUpload },
         "separator",
-        { label: "Upload files", icon: Upload, onSelect: () => fileInput.current?.click() },
-        { label: "Upload folder", icon: FolderUp, onSelect: () => dirInput.current?.click() },
+        { label: "Upload files", icon: Upload, onSelect: () => fileInput.current?.click(), disabled: !canUpload },
+        { label: "Upload folder", icon: FolderUp, onSelect: () => dirInput.current?.click(), disabled: !canUpload },
+        { label: "Upload encrypted files…", icon: Lock, onSelect: () => setDialog({ kind: "encUpload" }), disabled: !canUpload },
       ],
     });
   };
@@ -1032,29 +1285,33 @@ export default function Drive() {
     );
 
   const crumbs = listing && view.type === "folder" ? listing.breadcrumbs : [];
-  const placeName =
+  const placeBase =
     view.type === "folder"
       ? crumbs.length
         ? crumbs[crumbs.length - 1].name
-        : "My Drive"
+        : rootName
       : view.type === "recent"
         ? "Recent"
         : view.type === "starred"
           ? "Starred"
+          : view.type === "shared"
+            ? "Shared with me"
           : view.type === "trash"
             ? "Trash"
             : view.type === "kind"
           ? KIND_VIEWS.find((k) => k.kind === view.kind)!.label
           : `Results for “${view.q}”`;
+  const placeName = view.type !== "folder" && view.team ? `${placeBase} · ${rootName}` : placeBase;
   const userName = pool ? pool.user.name || pool.user.email.split("@")[0] : "";
   const stats = totals;
   const isEmpty = !loading && !loadError && entries.length === 0;
   const showLocation = view.type !== "folder" && view.type !== "trash";
 
   const navItems: { label: string; icon: LucideIcon; view: View; active: boolean }[] = [
-    { label: "My Drive", icon: HardDrive, view: { type: "folder", id: null }, active: view.type === "folder" },
+    { label: "My Drive", icon: HardDrive, view: { type: "folder", id: null, team: null }, active: view.type === "folder" && !view.team && !sharedPerm },
     { label: "Recent", icon: Clock, view: { type: "recent" }, active: view.type === "recent" },
     { label: "Starred", icon: Star, view: { type: "starred" }, active: view.type === "starred" },
+    { label: "Shared with me", icon: Share2, view: { type: "shared", team: null }, active: view.type === "shared" || !!sharedPerm },
     { label: "Trash", icon: Trash2, view: { type: "trash" }, active: view.type === "trash" },
     ...KIND_VIEWS.map((k) => ({
       label: k.label,
@@ -1121,7 +1378,7 @@ export default function Drive() {
         {design === "conferio" && <div className="navGroup">Drive views</div>}
         {navItems.map((n, i) => (
           <div key={n.label}>
-            {i === 4 && <div className="navGroup">Types</div>}
+            {i === 5 && <div className="navGroup">Types</div>}
             <button
               type="button"
               className={`navItem ${n.active ? "on" : ""} ${n.label === "My Drive" && dropTarget === "nav-root" ? "dropOn" : ""}`}
@@ -1134,6 +1391,29 @@ export default function Drive() {
             </button>
           </div>
         ))}
+        <div className="navGroup">Teams</div>
+        {teams.map((t) => {
+          const on = view.team === t.id && view.type === "folder";
+          return (
+            <button
+              key={t.id}
+              type="button"
+              className={`navItem ${on ? "on" : ""}`}
+              aria-current={on ? "page" : undefined}
+              onClick={() => navigate({ type: "folder", id: null, team: t.id })}
+              title={`${t.name} · ${ROLE_INFO[t.role].label}`}
+            >
+              <Users size={18} aria-hidden />
+              <span>{t.name}</span>
+              <span className="navHint">{ROLE_INFO[t.role].label}</span>
+            </button>
+          );
+        })}
+        <button type="button" className="navItem" onClick={() => setShowTeams(true)}>
+          <UserPlus size={18} aria-hidden />
+          <span>{teams.length ? "Manage teams" : "Create a team"}</span>
+          {inviteCount > 0 && <span className="navHint">{inviteCount} invite{inviteCount === 1 ? "" : "s"}</span>}
+        </button>
         <div className="navGroup">This PC & storage</div>
         <button type="button" className="navItem" onClick={() => setShowDevices(true)}>
           <Monitor size={18} aria-hidden />
@@ -1161,11 +1441,11 @@ export default function Drive() {
 
   const rail = design === "conferio" && (
     <nav className="rail" aria-label="Quick navigation">
-      <button type="button" className="railBrand" onClick={() => openFolder(null)} aria-label="TG Drive home">
+      <button type="button" className="railBrand" onClick={() => navigate({ type: "folder", id: null, team: null })} aria-label="TG Drive home">
         <HardDrive size={20} aria-hidden />
       </button>
       {[
-        { icon: Home, label: "My Drive", v: { type: "folder", id: null } as View, on: view.type === "folder" },
+        { icon: Home, label: "My Drive", v: { type: "folder", id: null, team: null } as View, on: view.type === "folder" && !view.team },
         { icon: Clock, label: "Recent", v: { type: "recent" } as View, on: view.type === "recent" },
         { icon: ImageIcon, label: "Images", v: { type: "kind", kind: "image" } as View, on: view.type === "kind" && view.kind === "image" },
         { icon: Film, label: "Videos", v: { type: "kind", kind: "video" } as View, on: view.type === "kind" && view.kind === "video" },
@@ -1210,10 +1490,10 @@ export default function Drive() {
           <button
             type="button"
             className={`crumb ${crumbs.length ? "" : "here"} ${dropTarget === "crumb-root" ? "dropOn" : ""}`}
-            onClick={() => openFolder(null)}
-            {...folderDropProps(null, "crumb-root")}
+            onClick={() => (sharedPerm ? navigate({ type: "shared", team: null }) : openFolder(null))}
+            {...(sharedPerm ? {} : folderDropProps(null, "crumb-root"))}
           >
-            {design === "nimbus" ? <Home size={16} aria-label="My Drive" /> : "My Drive"}
+            {design === "nimbus" && !view.team && !sharedPerm ? <Home size={16} aria-label="My Drive" /> : rootName}
           </button>
           {crumbs.map((c, i) => (
             <span key={c.id} className="crumbPart">
@@ -1308,8 +1588,11 @@ export default function Drive() {
   ) : null;
 
   const whereBadge = (f: FileItem) => (
-    <span className={`where ${f.backend}`} title={f.account ?? (f.backend === "r2" ? "Cloudflare R2" : f.backend === "gdrive" ? "Google Drive" : "Telegram")}>
-      {f.backend === "gdrive" ? "Drive" : f.backend === "r2" ? "R2" : "TG"}
+    <span
+      className={`where ${f.backend === "s3" ? "r2" : f.backend}`}
+      title={f.account ?? ({ r2: "Cloudflare R2", s3: "S3", webdav: "WebDAV", gdrive: "Google Drive" } as Record<string, string>)[f.backend] ?? "Telegram"}
+    >
+      {({ gdrive: "Drive", r2: "R2", s3: "S3", webdav: "DAV" } as Record<string, string>)[f.backend] ?? "TG"}
     </span>
   );
 
@@ -1421,12 +1704,18 @@ export default function Drive() {
                     {e.name}
                   </span>
                   {isStarred(e) && <Star size={14} className="starMark" aria-label="Starred" />}
+                  {e.type === "file" && e.file.encrypted && <Lock size={13} className="starMark" aria-label="Encrypted" />}
                   {e.type === "file" && e.file.status !== "ready" && <span className="badge warn">Incomplete</span>}
                 </span>
               </td>
               {showLocation && (
                 <td className="cLoc">
-                  {e.type === "file" && (
+                  {shareOf(e) ? (
+                    <span className="small muted" title={shareOf(e)!.expiresAt ? `until ${new Date(shareOf(e)!.expiresAt!).toLocaleDateString()}` : undefined}>
+                      {shareOf(e)!.locked && <Lock size={13} aria-label="Password protected" />} {shareOf(e)!.by} ·{" "}
+                      {SHARE_INFO[shareOf(e)!.permission].label}
+                    </span>
+                  ) : e.type === "file" && (
                     <button
                       type="button"
                       className="linkBtn small"
@@ -1487,6 +1776,7 @@ export default function Drive() {
                       {f.name}
                     </span>
                     {f.starred && <Star size={14} className="starMark" aria-label="Starred" />}
+                    {f.encrypted && <Lock size={13} className="starMark" aria-label="Encrypted" />}
                     {kebab(e)}
                   </div>
                   <div className="thumb">
@@ -1532,6 +1822,14 @@ export default function Drive() {
           <Trash2 size={44} aria-hidden />
           <h3>Trash is empty</h3>
           <p className="muted">Things you delete stay here for {trashDays} days, so you can restore them.</p>
+        </div>
+      );
+    if (view.type === "shared")
+      return (
+        <div className="empty">
+          <Share2 size={44} aria-hidden />
+          <h3>Nothing shared with you yet</h3>
+          <p className="muted">When someone shares a file or folder with you, it shows up here and in your notifications.</p>
         </div>
       );
     if (view.type === "starred")
@@ -1608,6 +1906,16 @@ export default function Drive() {
           )}
           {searchBox}
           <div className="topActions">
+            <NotificationsBell
+              onChanged={() => void loadTeams()}
+              onOpenTeam={(id) => {
+                setShowTeams(false);
+                navigate({ type: "folder", id: null, team: id });
+              }}
+              onOpenShare={(kind, id) =>
+                navigate(kind === "folder" ? { type: "folder", id, team: null } : { type: "shared", team: null })
+              }
+            />
             <label className="destPick" title="Default storage for new uploads (saved to your account)">
               <span className="sr">Default storage for new uploads</span>
               <Cloud size={16} aria-hidden />
@@ -1635,9 +1943,11 @@ export default function Drive() {
           {view.type === "trash" && (results?.files.length || results?.folders.length) ? (
             <div className="banner info">
               <Trash2 size={16} aria-hidden /> Items in the trash are deleted forever after {trashDays} days.
-              <button type="button" className="linkBtn" onClick={() => setDialog({ kind: "emptyTrash" })}>
-                Empty trash
-              </button>
+              {allowed("deleteForever") && (
+                <button type="button" className="linkBtn" onClick={() => setDialog({ kind: "emptyTrash" })}>
+                  Empty trash
+                </button>
+              )}
             </div>
           ) : null}
           {chips}
@@ -1662,6 +1972,7 @@ export default function Drive() {
       </main>
 
       <input ref={fileInput} type="file" multiple hidden onChange={onPickFiles} />
+      <input ref={encInput} type="file" multiple hidden onChange={onPickEncrypted} />
       <input ref={dirInput} type="file" multiple hidden onChange={onPickFolder} />
 
       {jobs.length > 0 && (
@@ -1736,7 +2047,7 @@ export default function Drive() {
           index={preview.index}
           onIndex={(index) => setPreview((p) => (p ? { ...p, index } : p))}
           onClose={() => setPreview(null)}
-          onDownload={(f) => void download([f])}
+          onDownload={canDownloadFile(preview.files[preview.index]) ? (f) => void download([f]) : undefined}
         />
       )}
 
@@ -1748,7 +2059,10 @@ export default function Drive() {
           confirmText="Create"
           onClose={() => setDialog(null)}
           onSubmit={async (name) => {
-            await api("/api/folders", { method: "POST", body: JSON.stringify({ parentId: folderId, name }) });
+            await api("/api/folders", {
+              method: "POST",
+              body: JSON.stringify({ parentId: folderId, name, team: view.team ?? null }),
+            });
             await load(viewRef.current, true);
             toast("success", `Created “${name}”.`);
           }}
@@ -1789,7 +2103,7 @@ export default function Drive() {
           confirmText="Empty trash"
           onClose={() => setDialog(null)}
           onConfirm={async () => {
-            const r = await api<{ deleted: number }>("/api/trash", { method: "DELETE" });
+            const r = await api<{ deleted: number }>(`/api/trash?${teamQs(view)}`, { method: "DELETE" });
             void load(viewRef.current, true);
             void loadPool();
             toast("success", `Deleted ${plural(r.deleted)} forever.`);
@@ -1811,6 +2125,8 @@ export default function Drive() {
         <MoveDialog
           count={dialog.files.length}
           start={view.type === "folder" ? view.id : null}
+          team={view.team ?? null}
+          rootName={rootName}
           onClose={() => setDialog(null)}
           onMove={(target) => moveFiles(dialog.files.map((f) => f.id), target)}
         />
@@ -1833,10 +2149,94 @@ export default function Drive() {
       {showStorage && (
         <Modal title={`Storage pool${pool ? ` · ${pool.user.email}` : ""}`} onClose={() => setShowStorage(false)} wide>
           {pool ? <StoragePool pool={pool} onDisconnect={disconnect} onRefresh={() => loadPool(true)} /> : <p className="muted">Loading…</p>}
+          <ConnectionsPanel />
         </Modal>
       )}
 
-      {showDevices && <DevicesModal onClose={() => setShowDevices(false)} />}
+      {dialog?.kind === "share" && (
+        <ShareDialog
+          item={{
+            kind: dialog.entry.type,
+            id: dialog.entry.id,
+            name: dialog.entry.name,
+            encrypted: dialog.entry.type === "file" && !!dialog.entry.file.encrypted,
+          }}
+          maxPermission={dialog.max}
+          onClose={() => setDialog(null)}
+        />
+      )}
+      {dialog?.kind === "encUpload" && (
+        <SetPasswordDialog
+          title="Upload encrypted files"
+          intro="Pick a password, then choose the files. Each file is encrypted with its own key, locked with this password, before it's stored in Telegram, Google Drive or R2."
+          confirmText="Choose files…"
+          onClose={() => setDialog(null)}
+          onSubmit={(pw) => {
+            encPassword.current = pw;
+            encInput.current?.click();
+          }}
+        />
+      )}
+      {dialog?.kind === "encrypt" && (
+        <SetPasswordDialog
+          title={`Encrypt “${dialog.file.name}”`}
+          intro="The file is rewritten encrypted (like moving it to other storage), then the unencrypted copy is deleted. Opening it will need this password. The PC drive (T:) can't open encrypted files."
+          confirmText="Encrypt"
+          onClose={() => setDialog(null)}
+          onSubmit={(pw) => {
+            void recrypt(dialog.file, { mode: "encrypt", password: pw });
+          }}
+        />
+      )}
+      {dialog?.kind === "changePw" && (
+        <SetPasswordDialog
+          title={`New password for “${dialog.file.name}”`}
+          intro="The file isn't rewritten: only its key is locked with the new password. Passwords of existing shares keep working."
+          confirmText="Change password"
+          onClose={() => setDialog(null)}
+          onSubmit={async (pw) => {
+            await api(`/api/files/${dialog.file.id}/encryption`, { method: "PATCH", body: JSON.stringify({ password: pw }) });
+            toast("success", "Password changed.");
+          }}
+        />
+      )}
+      {dialog?.kind === "unlockFile" && (
+        <UnlockDialog
+          fileId={dialog.file.id}
+          name={dialog.file.name}
+          onClose={() => setDialog(null)}
+          onUnlocked={() => dialog.then()}
+        />
+      )}
+      {dialog?.kind === "unlock" && (
+        <UnlockDialog
+          shareId={dialog.shareId}
+          name={dialog.name}
+          onClose={() => setDialog(null)}
+          onUnlocked={() => {
+            setLoadError(null);
+            dialog.then();
+          }}
+        />
+      )}
+      {showTeams && (
+        <TeamsModal
+          initialTeam={view.team ?? null}
+          myId={myId}
+          onClose={() => setShowTeams(false)}
+          onChanged={(left) => {
+            void loadTeams();
+            // You left or deleted the team you're looking at: go back to My Drive.
+            if (left && left === viewRef.current.team) navigate({ type: "folder", id: null, team: null });
+            else void load(viewRef.current, true);
+          }}
+          onOpen={(id) => {
+            setShowTeams(false);
+            navigate({ type: "folder", id: null, team: id });
+          }}
+        />
+      )}
+      {showDevices && <DevicesModal pool={pool} onClose={() => setShowDevices(false)} onChanged={() => void loadPool()} />}
 
       {dragging && (
         <div className="dropOverlay" aria-hidden>
@@ -1856,32 +2256,6 @@ export default function Drive() {
 
 const isStarred = (e: Entry) => (e.type === "folder" ? !!e.folder.starred : !!e.file.starred);
 
-function storageLabel(v: string, pool: Pool | null) {
-  if (v === "telegram") return "Telegram";
-  if (v === "r2") return "Cloudflare R2";
-  if (v === "gdrive") return "Google Drive";
-  const acct = pool?.google.find((g) => `gdrive:${g.id}` === v);
-  return acct ? `Google Drive (${acct.email})` : "Google Drive";
-}
-
-function StorageOptions({ pool, current }: { pool: Pool | null; current: string }) {
-  const google = pool?.google ?? [];
-  const known = ["gdrive", "telegram", "r2", ...google.map((g) => `gdrive:${g.id}`)];
-  return (
-    <>
-      <option value="gdrive">Google Drive (most free space)</option>
-      {google.map((g) => (
-        <option key={g.id} value={`gdrive:${g.id}`} disabled={g.needsReauth}>
-          Google: {g.email} ({g.needsReauth ? "reconnect needed" : g.free == null ? "unlimited" : `${formatBytes(g.free)} free`})
-        </option>
-      ))}
-      <option value="telegram">Telegram</option>
-      {pool?.r2.configured && <option value="r2">Cloudflare R2 ({formatBytes(pool.r2.free)} free)</option>}
-      {!known.includes(current) && <option value={current}>{storageLabel(current, pool)}</option>}
-    </>
-  );
-}
-
 function StorageDialog({
   entries,
   pool,
@@ -1896,7 +2270,11 @@ function StorageDialog({
   const [target, setTarget] = useState("gdrive");
   const files = entries.filter((e): e is Extract<Entry, { type: "file" }> => e.type === "file");
   const folders = entries.length - files.length;
-  const current = new Set(files.map((e) => (e.file.backend === "gdrive" ? "Google Drive" : e.file.backend === "r2" ? "Cloudflare R2" : "Telegram")));
+  const where = (b: string) =>
+    b === "gdrive" ? "Google Drive" : b === "r2" ? "Cloudflare R2" : b === "s3" ? "S3" : b === "webdav" ? "WebDAV" : "Telegram";
+  const current = new Set(files.map((e) => where(e.file.backend)));
+  const conns = [...(pool?.connections?.mine ?? []), ...(pool?.connections?.offered ?? [])];
+  const kindName = { telegram: "Telegram", s3: "S3", webdav: "WebDAV" } as const;
   const options: { value: string; label: string; hint: string; disabled?: boolean }[] = [
     { value: "gdrive", label: "Google Drive", hint: "The connected account with the most free space" },
     ...(pool?.google ?? []).map((g) => ({
@@ -1905,8 +2283,18 @@ function StorageDialog({
       hint: g.needsReauth ? "Reconnect this account first" : g.free == null ? "Unlimited" : `${formatBytes(g.free)} free`,
       disabled: g.needsReauth,
     })),
-    { value: "telegram", label: "Telegram", hint: "No fixed limit" },
-    ...(pool?.r2.configured ? [{ value: "r2", label: "Cloudflare R2", hint: `${formatBytes(pool.r2.free)} free · fastest` }] : []),
+    ...(pool?.offeredGoogle ?? []).map((g) => ({
+      value: `gdrive:${g.id}`,
+      label: `${g.email} (${g.team ?? "team"})`,
+      hint: g.free == null ? "Unlimited" : `${formatBytes(g.free)} free`,
+    })),
+    { value: "telegram", label: "Telegram", hint: "Your bot, else your team's, else the server's" },
+    ...(pool?.r2.configured ? [{ value: "r2", label: "S3 / R2", hint: `Your bucket, else your team's, else the server's R2 (${formatBytes(pool.r2.free)} free)` }] : []),
+    ...conns.map((c) => ({
+      value: `conn:${c.id}`,
+      label: `${kindName[c.kind]}: ${c.name}`,
+      hint: `${c.summary}${c.teamName ? ` · ${c.teamName}` : ""}${c.limit != null ? ` · ${formatBytes(Math.max(0, c.limit - c.used))} free` : ""}`,
+    })),
   ];
   return (
     <Modal
@@ -1972,11 +2360,15 @@ function Thumb({ file }: { file: FileItem }) {
 function MoveDialog({
   count,
   start,
+  team,
+  rootName,
   onClose,
   onMove,
 }: {
   count: number;
   start: string | null;
+  team: string | null;
+  rootName: string;
   onClose: () => void;
   onMove: (target: string | null) => Promise<void>;
 }) {
@@ -1989,13 +2381,13 @@ function MoveDialog({
     let live = true;
     setData(null);
     setError(null);
-    api<Listing>(`/api/list?folder=${at ?? ""}`)
+    api<Listing>(`/api/list?folder=${at ?? ""}&team=${team ?? ""}`)
       .then((d) => live && setData(d))
       .catch((e) => live && setError(msg(e)));
     return () => {
       live = false;
     };
-  }, [at]);
+  }, [at, team]);
 
   const crumbs = data?.breadcrumbs ?? [];
   const parent = crumbs.length > 1 ? crumbs[crumbs.length - 2].id : null;

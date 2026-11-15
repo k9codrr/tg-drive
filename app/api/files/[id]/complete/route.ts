@@ -3,6 +3,7 @@ import { big, prisma } from "@/lib/db";
 import { refreshQuota } from "@/lib/google";
 import { fail, HttpError, parseId } from "@/lib/http";
 import { requireUser } from "@/lib/session";
+import { fileAccess } from "@/lib/space";
 
 export const runtime = "nodejs";
 
@@ -14,8 +15,9 @@ export async function POST(req: Request, { params }: Ctx) {
     const uid = await requireUser(req);
     const id = parseId((await params).id);
     if (!id) throw new HttpError(400, "Invalid id");
-    const file = await prisma.file.findFirst({
-      where: { id: big(id), userId: big(uid) },
+    await fileAccess(uid, id, "upload");
+    const file = await prisma.file.findUnique({
+      where: { id: big(id) },
       select: {
         size: true,
         chunkCount: true,

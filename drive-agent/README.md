@@ -40,6 +40,21 @@ Auth: per-device **app passwords** created in the web UI (`device_tokens` table)
 because Next.js route handlers can't receive WebDAV methods like PROPFIND, MKCOL and MOVE.
 This reuses the existing folder/file/chunk tables, so the website and `T:` always show the same data.
 
+**Where files copied to `T:` are stored** is set in the web app under *PC drive*:
+- account-wide: "Same as web uploads", Google (most free space), a specific Google account, Telegram or R2;
+- per PC: each device can override the account setting.
+
+If the chosen storage is full or not set up, the file falls back to the Google account with the most free
+space, then Telegram, so copies never get stuck retrying. `DAV_BACKEND=telegram|r2` on the server still
+overrides everything.
+
+**Encrypted files** (password-encrypted in the web app) are listed on `T:` but can't be opened there: the drive
+never has their password. Open them in the web app.
+
+**Skipped names**: folders and files named in *PC drive → Never upload* (default `node_modules, .next`)
+are never stored, whether uploaded in the browser or copied to `T:`. On `T:` the copy is accepted and dropped,
+so Explorer doesn't stall or show errors, and those names don't appear in listings.
+
 ### 2. Storage tuning on the server (needed for projects)
 A project is thousands of small files. Telegram allows about 20 uploads a minute, so small files must
 not go there:

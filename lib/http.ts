@@ -3,14 +3,15 @@ import { isUniqueViolation } from "./db";
 import { TelegramRateLimit } from "./telegram";
 
 export class HttpError extends Error {
-  constructor(public status: number, message: string) {
+  /** `data` is merged into the JSON error body (e.g. { locked: true, shareId }). */
+  constructor(public status: number, message: string, public data?: Record<string, unknown>) {
     super(message);
   }
 }
 
 export function fail(e: unknown) {
   if (e instanceof HttpError) {
-    return NextResponse.json({ error: e.message }, { status: e.status });
+    return NextResponse.json({ ...e.data, error: e.message }, { status: e.status });
   }
   if (e instanceof TelegramRateLimit) {
     return NextResponse.json(

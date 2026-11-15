@@ -4,6 +4,10 @@ const nextConfig: NextConfig = {
   poweredByHeader: false,
   // A stray package-lock.json in the home folder confuses Next's root detection.
   outputFileTracingRoot: __dirname,
+  // The /agent/<file> route reads these from disk; make sure they're deployed with it (Vercel).
+  outputFileTracingIncludes: {
+    "/agent/[file]": ["./drive-agent/install.ps1", "./drive-agent/mount.ps1", "./drive-agent/tgd.ps1", "./drive-agent/tgd.cmd"],
+  },
   // This PC has little free memory: build with webpack's memory savers. Type checking runs separately (tsc).
   experimental: { webpackMemoryOptimizations: true, cpus: 1 },
   typescript: { ignoreBuildErrors: process.env.TGD_SKIP_TYPECHECK === "1" },
