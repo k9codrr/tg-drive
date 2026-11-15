@@ -50,7 +50,10 @@ not go there:
 ### 3. Desktop agent (this folder)
 - `install.ps1`: installs **WinFsp** + **rclone**, saves the server URL + app password, and registers a
   task that mounts `T:` at login (the same approach as your cloudflared tunnel tasks).
-- `mount.ps1`: `rclone mount tgdrive: T: --vfs-cache-mode full --vfs-cache-max-size 10G ...`
+- `mount.ps1`: a watchdog around `rclone mount tgdrive: T: --vfs-cache-mode full ...`. `T:` is only
+  mounted while the TG Drive server answers. If the server stops, `T:` is removed after about 20 s
+  (instead of hanging Explorer) and comes back on its own when the server is up again. Its log is
+  `agent.log`, and rclone's log is `mount.log`.
 - `tgd.ps1`, the project command:
   - `tgd work conferio` copies the project's code from `T:` into a local workspace and runs
     `npm install` there. `node_modules`, `.next` and builds stay **local only** and never upload.
@@ -83,7 +86,8 @@ mount it too. Cloudflare limits a single upload to 100 MB, so on other PCs files
 This PC talks to `127.0.0.1:3021` directly and has no such limit.
 
 ## Limits to know
-- TG Drive itself runs on this PC. If the PC or the server is off, `T:` only shows what's in the
-  local cache.
+- TG Drive itself runs on this PC (drive.xivago.com is a tunnel to it, and the Vercel deploy doesn't
+  run the WebDAV server). While it's not running, `T:` is not shown at all. Start TG Drive and `T:`
+  appears within a few seconds. Changes still waiting to upload stay in the cache and are sent then.
 - Keep `.git` in projects (it syncs as small R2 files), but also push to GitHub. Two copies are safer.
 - R2's free tier is 10 GB. Source code is small, but the R2 limits in `.env` still apply.

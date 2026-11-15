@@ -12,3 +12,5 @@ out
 drive-agent/agent.json
 drive-agent/run-mount.vbs
 drive-agent/mount.log
+drive-agent/*.log
+drive-agent/*.log.old
