@@ -1,0 +1,8 @@
+.env
+.env.*
+drive-agent/agent.json
+drive-agent/run-mount.vbs
+drive-agent/mount.log
+.next
+node_modules
+*.tsbuildinfo
