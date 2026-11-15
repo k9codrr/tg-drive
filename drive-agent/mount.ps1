@@ -1,4 +1,4 @@
-# TG Drive mount watchdog. Started at login by install.ps1's "TG Drive mount" task and runs forever.
+﻿# TG Drive mount watchdog. Started at login by install.ps1's "TG Drive mount" task and runs forever.
 #
 # T: is only mounted while the TG Drive server answers. If the server is down (e.g. TG Drive isn't
 # started on this PC), a mounted T: makes Explorer hang on every access, and that can freeze the
@@ -18,6 +18,7 @@ $agentLog = Join-Path $here "agent.log"
 
 $CheckEvery = 5     # seconds between health checks
 $FailLimit = 4      # failed checks in a row before T: is removed (about 20 s)
+$MountWait = 60     # seconds rclone gets to make T: appear before it's restarted
 
 # Only one watchdog at a time (the task can be started again while one is running).
 $mutex = New-Object System.Threading.Mutex($false, "Local\TGDriveMountWatchdog")
@@ -53,6 +54,9 @@ function Test-Server($url) {
     return $false
   }
 }
+
+# Whether the drive letter exists. Uses the list of drive letters only, so a slow drive can't block it.
+function Test-Letter { [System.IO.Directory]::GetLogicalDrives() -contains "$letter\" }
 
 function Start-Mount {
   if ((Test-Path $mountLog) -and (Get-Item $mountLog).Length -gt 5MB) { Move-Item $mountLog "$mountLog.old" -Force }
@@ -96,6 +100,7 @@ if (-not $url) { Log "No 'tgdrive' rclone remote found. Run install.ps1 again.";
 Log "Watchdog started for $url (drive $letter)"
 
 $proc = $null
+$startedAt = Get-Date
 $fails = 0
 $waitingLogged = $false
 try {
@@ -110,6 +115,13 @@ try {
         if ($proc) { Log "rclone exited (code $($proc.ExitCode)); mounting again" }
         else { Log "Server is up; mounting $letter" }
         $proc = Start-Mount
+        $startedAt = Get-Date
+      } elseif (-not (Test-Letter) -and ((Get-Date) - $startedAt).TotalSeconds -gt $MountWait) {
+        # rclone sometimes starts but never creates the drive letter: restart it.
+        Log "rclone is running but $letter never appeared; restarting it"
+        Stop-Mount $proc
+        $proc = Start-Mount
+        $startedAt = Get-Date
       }
     } else {
       $fails++
