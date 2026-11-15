@@ -305,3 +305,69 @@ export async function deleteDriveFiles(items: { accountId: string; fileId: strin
     }
   }
 }
+
+/** Google answers 429 / 403 rateLimitExceeded / 5xx when busy: those are worth retrying. */
+export class DriveBusy extends Error {}
+
+/** Runs a Drive call, retrying "busy" answers and network errors with exponential backoff. */
+export async function driveRetry<T>(fn: () => Promise<T>, tries = 6): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      const retryable = e instanceof DriveBusy || (e instanceof TypeError && /fetch/i.test(e.message));
+      if (!retryable || attempt >= tries - 1) throw e;
+      await new Promise((r) => setTimeout(r, Math.min(30_000, 1000 * 2 ** attempt) + Math.random() * 500));
+    }
+  }
+}
+
+async function driveFail(res: Response, what: string): Promise<never> {
+  const text = await errText(res);
+  if (res.status === 429 || res.status >= 500 || (res.status === 403 && /rate|quota exceeded|userRateLimit/i.test(text))) {
+    throw new DriveBusy(`${what}: ${text}`);
+  }
+  throw new Error(`${what}: ${text}`);
+}
+
+/** Uploads a whole small file in one request (multipart). Returns the Drive file id. */
+export async function uploadMultipart(
+  token: string,
+  meta: { name: string; mime: string; parentId: string | null },
+  bytes: Uint8Array,
+) {
+  const boundary = `tgd${Math.random().toString(36).slice(2)}`;
+  const head = Buffer.from(
+    `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n` +
+      JSON.stringify({ name: meta.name, mimeType: meta.mime, ...(meta.parentId ? { parents: [meta.parentId] } : {}) }) +
+      `\r\n--${boundary}\r\nContent-Type: ${meta.mime}\r\n\r\n`,
+  );
+  const tail = Buffer.from(`\r\n--${boundary}--`);
+  const res = await fetch(`${UPLOAD}/files?uploadType=multipart&fields=id`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": `multipart/related; boundary=${boundary}` },
+    body: Buffer.concat([head, Buffer.from(bytes), tail]),
+  });
+  if (!res.ok) await driveFail(res, "Google Drive upload failed");
+  return String(((await res.json()) as { id: string }).id);
+}
+
+/**
+ * Sends one piece of a resumable upload, retrying when Drive is busy. If the answer is lost, asks Drive
+ * how much it has, so a piece is never sent twice. Returns the Drive file id when the upload completes.
+ */
+export async function putResumableSafe(url: string, bytes: Uint8Array, start: number, total: number) {
+  return driveRetry(async () => {
+    let result: ResumableResult;
+    try {
+      result = await putResumable(url, bytes, start, total);
+    } catch (e) {
+      const status = await queryResumable(url, total).catch(() => null);
+      if (!status || (!status.done && status.received < start + bytes.byteLength)) {
+        throw e instanceof Error && /HTTP (429|5\d\d)/.test(e.message) ? new DriveBusy(e.message) : e;
+      }
+      result = status;
+    }
+    return result.done ? result.fileId : null;
+  });
+}

@@ -33,7 +33,11 @@ import {
   Plus,
   RotateCw,
   Search,
+  Star,
+  StarOff,
   Trash2,
+  Undo2,
+  ArrowRightLeft,
   Upload,
   WifiOff,
   X,
@@ -80,7 +84,14 @@ export { formatBytes } from "./drive/lib";
 // ---------- types ----------
 
 type KindView = "image" | "video" | "audio" | "document";
-type View = { type: "folder"; id: string | null } | { type: "recent" } | { type: "kind"; kind: KindView } | { type: "search"; q: string };
+type View =
+  | { type: "folder"; id: string | null }
+  | { type: "recent" }
+  | { type: "starred" }
+  | { type: "trash" }
+  | { type: "kind"; kind: KindView }
+  | { type: "search"; q: string };
+type Results = { folders: Folder[]; files: FileItem[] };
 type Entry =
   | { key: string; type: "folder"; id: string; name: string; date: string; size: -1; folder: Folder }
   | { key: string; type: "file"; id: string; name: string; date: string; size: number; file: FileItem };
@@ -95,6 +106,9 @@ type Dialog =
   | { kind: "rename"; entry: Entry }
   | { kind: "delete"; entries: Entry[] }
   | { kind: "move"; files: FileItem[] }
+  | { kind: "storage"; entries: Entry[] }
+  | { kind: "forever"; entries: Entry[] }
+  | { kind: "emptyTrash" }
   | null;
 
 const KIND_VIEWS: { kind: KindView; label: string; icon: LucideIcon }[] = [
@@ -120,12 +134,16 @@ function readView(): View {
   if (q) return { type: "search", q };
   const v = p.get("view");
   if (v === "recent") return { type: "recent" };
+  if (v === "starred") return { type: "starred" };
+  if (v === "trash") return { type: "trash" };
   if (v === "image" || v === "video" || v === "audio" || v === "document") return { type: "kind", kind: v };
   return { type: "folder", id: p.get("f") };
 }
 function viewUrl(v: View) {
   if (v.type === "search") return `/?q=${encodeURIComponent(v.q)}`;
   if (v.type === "recent") return "/?view=recent";
+  if (v.type === "starred") return "/?view=starred";
+  if (v.type === "trash") return "/?view=trash";
   if (v.type === "kind") return `/?view=${v.kind}`;
   return v.id ? `/?f=${v.id}` : "/";
 }
@@ -167,7 +185,8 @@ export default function Drive() {
   const [view, setView] = useState<View>({ type: "folder", id: null });
   const [listing, setListing] = useState<Listing | null>(null);
   const [totals, setTotals] = useState<Listing["stats"] | null>(null);
-  const [results, setResults] = useState<FileItem[] | null>(null);
+  const [results, setResults] = useState<Results | null>(null);
+  const [trashDays, setTrashDays] = useState(30);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
@@ -190,7 +209,7 @@ export default function Drive() {
   const [showStorage, setShowStorage] = useState(false);
   const [showDevices, setShowDevices] = useState(false);
   const [sideOpen, setSideOpen] = useState(false);
-  const [dest, setDest] = useState("telegram");
+  const [dest, setDest] = useState("gdrive");
   const [offline, setOffline] = useState(false);
 
   const fileInput = useRef<HTMLInputElement>(null);
@@ -238,12 +257,6 @@ export default function Drive() {
     }
     setView(readView());
     setSort(store<Sort>("tgd_sort", { key: "name", dir: 1 }));
-    try {
-      const saved = localStorage.getItem("tgd_dest");
-      if (saved) setDest(saved);
-    } catch {
-      /* ignore */
-    }
     setOffline(!navigator.onLine);
     setMounted(true);
   }, []);
@@ -288,12 +301,17 @@ export default function Drive() {
         setListing(d);
         setTotals(d.stats);
         setResults(null);
+      } else if (v.type === "starred" || v.type === "trash") {
+        const r = await api<Results & { days?: number }>(`/api/${v.type}`);
+        if (seq !== loadSeq.current) return;
+        setResults({ folders: r.folders, files: r.files });
+        if (r.days) setTrashDays(r.days);
       } else {
         const qs =
           v.type === "recent" ? "recent=1" : v.type === "kind" ? `type=${v.kind}` : `q=${encodeURIComponent(v.q)}`;
         const r = await api<{ files: FileItem[] }>(`/api/search?${qs}`);
         if (seq !== loadSeq.current) return;
-        setResults(r.files);
+        setResults({ folders: [], files: r.files });
       }
       setLoadError(null);
     } catch (e) {
@@ -344,23 +362,21 @@ export default function Drive() {
     }
   }, [mounted, loadPool, toast]);
 
-  // If the chosen destination account disappears, fall back to Telegram
+  // The default storage lives in the database (users.default_storage), so it's the same everywhere.
   useEffect(() => {
-    if (!pool) return;
-    const ok =
-      dest === "telegram" ||
-      (dest === "r2" && pool.r2.configured) ||
-      (dest === "gdrive" && pool.google.some((g) => !g.needsReauth)) ||
-      pool.google.some((g) => `gdrive:${g.id}` === dest && !g.needsReauth);
-    if (!ok) setDest("telegram");
-  }, [pool, dest]);
+    if (pool?.defaultStorage) setDest(pool.defaultStorage);
+  }, [pool?.defaultStorage]);
 
-  const chooseDest = (v: string) => {
+  const chooseDest = async (v: string) => {
+    const prev = dest;
     setDest(v);
     try {
-      localStorage.setItem("tgd_dest", v);
-    } catch {
-      /* ignore */
+      await api("/api/settings", { method: "PATCH", body: JSON.stringify({ defaultStorage: v }) });
+      setPool((p) => (p ? { ...p, defaultStorage: v } : p));
+      toast("success", `New uploads now go to ${storageLabel(v, pool)}.`);
+    } catch (e) {
+      setDest(prev);
+      fail(e);
     }
   };
 
@@ -409,17 +425,23 @@ export default function Drive() {
 
   // ----- entries (sorted, filtered) -----
   const entries = useMemo<Entry[]>(() => {
-    const folders: Entry[] =
-      view.type === "folder" && listing
-        ? listing.folders.map((f) => ({ key: `d:${f.id}`, type: "folder", id: f.id, name: f.name, date: f.createdAt, size: -1, folder: f }))
-        : [];
-    const fileList = view.type === "folder" ? (listing?.files ?? []) : (results ?? []);
+    const folderList = view.type === "folder" ? (listing?.folders ?? []) : (results?.folders ?? []);
+    const folders: Entry[] = folderList.map((f) => ({
+      key: `d:${f.id}`,
+      type: "folder",
+      id: f.id,
+      name: f.name,
+      date: view.type === "trash" && f.trashedAt ? f.trashedAt : f.createdAt,
+      size: -1,
+      folder: f,
+    }));
+    const fileList = view.type === "folder" ? (listing?.files ?? []) : (results?.files ?? []);
     const files: Entry[] = fileList.map((f) => ({
       key: `f:${f.id}`,
       type: "file",
       id: f.id,
       name: f.name,
-      date: f.createdAt,
+      date: view.type === "trash" && f.trashedAt ? f.trashedAt : f.createdAt,
       size: f.size,
       file: f,
     }));
@@ -430,7 +452,8 @@ export default function Drive() {
       else r = a.size - b.size;
       return r * sort.dir || a.name.localeCompare(b.name);
     };
-    const keepSorted = view.type === "recent" && sort.key === "name" && sort.dir === 1; // recent = newest first by default
+    // Recent and Trash come newest first from the server; keep that unless the user picks a sort.
+    const keepSorted = (view.type === "recent" || view.type === "trash") && sort.key === "name" && sort.dir === 1;
     const matches = (e: Entry) => {
       if (filter === "all") return true;
       if (filter === "folders") return e.type === "folder";
@@ -438,7 +461,7 @@ export default function Drive() {
       const k = kindOf(e.file.mime, e.file.name);
       return filter === "document" ? DOC_KINDS.has(k) : k === filter;
     };
-    return [...folders.sort(cmp), ...(keepSorted ? files : files.sort(cmp))].filter(matches);
+    return [...(keepSorted ? folders : folders.sort(cmp)), ...(keepSorted ? files : files.sort(cmp))].filter(matches);
   }, [view.type, listing, results, sort, filter]);
 
   const shown = entries.slice(0, limit);
@@ -516,8 +539,8 @@ export default function Drive() {
       done: 0,
       status: "queued",
     }));
-    newJobs.forEach((j, i) => pendingByKey.current.set(j.key, { item: items[i], target, dest }));
-    queue.current.push({ items, keys: newJobs.map((j) => j.key), target, dest });
+    newJobs.forEach((j, i) => pendingByKey.current.set(j.key, { item: items[i], target, dest: "default" }));
+    queue.current.push({ items, keys: newJobs.map((j) => j.key), target, dest: "default" });
     setJobs((js) => [...js.filter((j) => j.status !== "cancelled"), ...newJobs]);
     setUploadsOpen(true);
     void runQueue();
@@ -634,7 +657,7 @@ export default function Drive() {
   // ----- actions -----
   const moveFiles = async (ids: string[], target: string | null) => {
     const files = ids.filter((id) => {
-      const f = (view.type === "folder" ? listing?.files : results)?.find((x) => x.id === id);
+      const f = (view.type === "folder" ? listing?.files : results?.files)?.find((x) => x.id === id);
       return !f || f.folderId !== target;
     });
     if (!files.length) return;
@@ -669,21 +692,135 @@ export default function Drive() {
     }
   };
 
-  const doDelete = async (list: Entry[]) => {
-    let failed = 0;
+  const plural = (n: number, w = "item") => `${n} ${w}${n === 1 ? "" : "s"}`;
+  const kindPath = (e: Entry) => (e.type === "folder" ? "folders" : "files");
+
+  /** Runs one request per item; returns the ones that worked. */
+  const each = async (list: Entry[], fn: (e: Entry) => Promise<unknown>) => {
+    const ok: Entry[] = [];
     for (const e of list) {
       try {
-        await api(`/api/${e.type === "folder" ? "folders" : "files"}/${e.id}`, { method: "DELETE" });
+        await fn(e);
+        ok.push(e);
       } catch (err) {
-        failed++;
         if (list.length === 1) throw err;
       }
     }
+    return ok;
+  };
+
+  const restore = async (list: Entry[]) => {
+    const r = await api<{ restored: number; failed: number }>("/api/trash/restore", {
+      method: "POST",
+      body: JSON.stringify({
+        files: list.filter((e) => e.type === "file").map((e) => e.id),
+        folders: list.filter((e) => e.type === "folder").map((e) => e.id),
+      }),
+    });
+    setSelected(new Set());
+    void load(viewRef.current, true);
+    if (r.failed) toast("error", `${plural(r.failed)} couldn't be restored.`);
+    else toast("success", list.length === 1 ? `Restored “${list[0].name}”.` : `Restored ${plural(list.length)}.`);
+  };
+
+  const moveToTrash = async (list: Entry[]) => {
+    if (!list.length) return;
+    try {
+      const ok = await each(list, (e) => api(`/api/${kindPath(e)}/${e.id}`, { method: "DELETE" }));
+      setSelected(new Set());
+      void load(viewRef.current, true);
+      if (ok.length < list.length) toast("error", `${plural(list.length - ok.length)} couldn't be moved to the trash.`);
+      if (ok.length)
+        toast("info", ok.length === 1 ? `“${ok[0].name}” moved to the trash.` : `${plural(ok.length)} moved to the trash.`, {
+          action: { label: "Undo", run: () => void restore(ok).catch(fail) },
+        });
+    } catch (e) {
+      fail(e);
+    }
+  };
+
+  const deleteForever = async (list: Entry[]) => {
+    const ok = await each(list, (e) => api(`/api/${kindPath(e)}/${e.id}?forever=1`, { method: "DELETE" }));
     setSelected(new Set());
     void load(viewRef.current, true);
     void loadPool();
-    if (failed) toast("error", `${failed} item${failed === 1 ? "" : "s"} couldn't be deleted.`);
-    else toast("success", list.length === 1 ? `Deleted “${list[0].name}”.` : `Deleted ${list.length} items.`);
+    if (ok.length < list.length) toast("error", `${plural(list.length - ok.length)} couldn't be deleted.`);
+    else toast("success", list.length === 1 ? `Deleted “${list[0].name}” forever.` : `Deleted ${plural(list.length)} forever.`);
+  };
+
+  const setStar = async (list: Entry[], starred: boolean) => {
+    try {
+      await each(list, (e) => api(`/api/${kindPath(e)}/${e.id}`, { method: "PATCH", body: JSON.stringify({ starred }) }));
+      void load(viewRef.current, true);
+      toast("success", `${list.length === 1 ? `“${list[0].name}”` : plural(list.length)} ${starred ? "added to" : "removed from"} Starred.`);
+    } catch (e) {
+      fail(e);
+    }
+  };
+
+  // ----- moving files to another storage -----
+  const transferring = useRef(false);
+  const changeStorage = async (list: Entry[], target: string) => {
+    if (transferring.current) return toast("error", "Another storage move is still running.");
+    transferring.current = true;
+    const label = storageLabel(target, pool);
+    const t = toast("progress", `Checking what to move to ${label}…`);
+    try {
+      const plan = await api<{ files: { id: string; name: string; size: number }[] }>("/api/transfer", {
+        method: "POST",
+        body: JSON.stringify({
+          target,
+          files: list.filter((e) => e.type === "file").map((e) => e.id),
+          folders: list.filter((e) => e.type === "folder").map((e) => e.id),
+        }),
+      });
+      if (!plan.files.length) {
+        dismiss(t);
+        toast("success", `Everything selected is already in ${label}.`);
+        return;
+      }
+      const total = Math.max(1, plan.files.reduce((s, f) => s + f.size, 0));
+      let doneBytes = 0;
+      const failed: string[] = [];
+      for (const [i, f] of plan.files.entries()) {
+        for (let attempt = 0; ; ) {
+          try {
+            const r = await api<{ done: boolean; copied: number; size: number }>(`/api/files/${f.id}/transfer`, {
+              method: "POST",
+              body: JSON.stringify({ target }),
+            });
+            patchToast(t, {
+              text: `Moving to ${label}: ${f.name} (${i + 1} of ${plan.files.length})`,
+              progress: Math.round(((doneBytes + r.copied) / total) * 100),
+            });
+            if (r.done) break;
+          } catch (e) {
+            // Network blips and timeouts: try the same file again (the copy resumes where it stopped).
+            if (++attempt >= 4 || (e instanceof Error && /not configured|Not enough|not available|No Google/i.test(e.message))) {
+              failed.push(`${f.name}: ${msg(e)}`);
+              break;
+            }
+            await new Promise((r) => setTimeout(r, 2000 * attempt));
+          }
+        }
+        doneBytes += f.size;
+      }
+      dismiss(t);
+      void load(viewRef.current, true);
+      void loadPool(true);
+      const moved = plan.files.length - failed.length;
+      if (moved) toast("success", `Moved ${plural(moved, "file")} to ${label}.`);
+      if (failed.length)
+        toast("error", `${plural(failed.length, "file")} couldn't be moved. ${failed[0]}`, {
+          sticky: true,
+          action: { label: "Retry", run: () => void changeStorage(list, target) },
+        });
+    } catch (e) {
+      dismiss(t);
+      fail(e);
+    } finally {
+      transferring.current = false;
+    }
   };
 
   const logout = async () => {
@@ -703,6 +840,7 @@ export default function Drive() {
   };
 
   const open = (e: Entry) => {
+    if (e.type === "folder" && view.type === "trash") return toast("info", "Restore this folder to open it.");
     if (e.type === "folder") return openFolder(e.id);
     const i = visibleFiles.findIndex((f) => f.id === e.id);
     setPreview({ files: visibleFiles, index: Math.max(0, i) });
@@ -751,12 +889,28 @@ export default function Drive() {
     const many = selected.has(e.key) && selected.size > 1;
     const targets = many ? selectedEntries : [e];
     const files = targets.filter((x): x is Extract<Entry, { type: "file" }> => x.type === "file").map((x) => x.file);
+    if (view.type === "trash")
+      return [
+        { label: many ? `Restore ${plural(targets.length)}` : "Restore", icon: Undo2, onSelect: () => void restore(targets).catch(fail) },
+        ...(!many && e.type === "file" ? [{ label: "Preview", icon: Eye, onSelect: () => open(e) } as MenuItem] : []),
+        "separator",
+        { label: "Delete forever", icon: Trash2, danger: true, onSelect: () => setDialog({ kind: "forever", entries: targets }), shortcut: "Del" },
+      ];
+    const allStarred = targets.every(isStarred);
+    const starItem: MenuItem = {
+      label: allStarred ? "Remove from Starred" : "Add to Starred",
+      icon: allStarred ? StarOff : Star,
+      onSelect: () => void setStar(targets, !allStarred),
+    };
+    const storageItem: MenuItem = { label: "Change storage…", icon: ArrowRightLeft, onSelect: () => setDialog({ kind: "storage", entries: targets }) };
     if (many)
       return [
         { label: `Download ${files.length} file${files.length === 1 ? "" : "s"}`, icon: Download, onSelect: () => void download(files), disabled: !files.length },
         { label: "Move to…", icon: FolderInput, onSelect: () => setDialog({ kind: "move", files }), disabled: !files.length || targets.some((t) => t.type === "folder") },
+        starItem,
+        storageItem,
         "separator",
-        { label: `Delete ${targets.length} items`, icon: Trash2, danger: true, onSelect: () => setDialog({ kind: "delete", entries: targets }), shortcut: "Del" },
+        { label: `Move ${targets.length} items to trash`, icon: Trash2, danger: true, onSelect: () => void moveToTrash(targets), shortcut: "Del" },
       ];
     const items: MenuItem[] = [
       { label: e.type === "folder" ? "Open" : "Preview", icon: e.type === "folder" ? FolderOpen : Eye, onSelect: () => open(e), shortcut: "Enter" },
@@ -768,7 +922,8 @@ export default function Drive() {
     }
     items.push("separator", { label: "Rename", icon: Pencil, onSelect: () => setDialog({ kind: "rename", entry: e }), shortcut: "F2" });
     if (e.type === "file") items.push({ label: "Move to…", icon: FolderInput, onSelect: () => setDialog({ kind: "move", files: [e.file] }) });
-    items.push("separator", { label: "Delete", icon: Trash2, danger: true, onSelect: () => setDialog({ kind: "delete", entries: [e] }), shortcut: "Del" });
+    items.push(starItem, storageItem);
+    items.push("separator", { label: "Move to trash", icon: Trash2, danger: true, onSelect: () => void moveToTrash([e]), shortcut: "Del" });
     return items;
   };
   const showMenu = (e: Entry, anchor: MenuAnchor) => {
@@ -845,8 +1000,9 @@ export default function Drive() {
       } else if (e.key === "Escape" && selected.size) {
         setSelected(new Set());
       } else if (e.key === "Delete" && selectedEntries.length) {
-        setDialog({ kind: "delete", entries: selectedEntries });
-      } else if (e.key === "F2" && selectedEntries.length === 1) {
+        if (view.type === "trash") setDialog({ kind: "forever", entries: selectedEntries });
+        else void moveToTrash(selectedEntries);
+      } else if (e.key === "F2" && selectedEntries.length === 1 && view.type !== "trash") {
         e.preventDefault();
         setDialog({ kind: "rename", entry: selectedEntries[0] });
       } else if (e.key === "Backspace" && e.altKey === false && view.type === "folder" && listing?.breadcrumbs.length) {
@@ -883,17 +1039,23 @@ export default function Drive() {
         : "My Drive"
       : view.type === "recent"
         ? "Recent"
-        : view.type === "kind"
+        : view.type === "starred"
+          ? "Starred"
+          : view.type === "trash"
+            ? "Trash"
+            : view.type === "kind"
           ? KIND_VIEWS.find((k) => k.kind === view.kind)!.label
           : `Results for “${view.q}”`;
   const userName = pool ? pool.user.name || pool.user.email.split("@")[0] : "";
   const stats = totals;
   const isEmpty = !loading && !loadError && entries.length === 0;
-  const showLocation = view.type !== "folder";
+  const showLocation = view.type !== "folder" && view.type !== "trash";
 
   const navItems: { label: string; icon: LucideIcon; view: View; active: boolean }[] = [
     { label: "My Drive", icon: HardDrive, view: { type: "folder", id: null }, active: view.type === "folder" },
     { label: "Recent", icon: Clock, view: { type: "recent" }, active: view.type === "recent" },
+    { label: "Starred", icon: Star, view: { type: "starred" }, active: view.type === "starred" },
+    { label: "Trash", icon: Trash2, view: { type: "trash" }, active: view.type === "trash" },
     ...KIND_VIEWS.map((k) => ({
       label: k.label,
       icon: k.icon,
@@ -959,7 +1121,7 @@ export default function Drive() {
         {design === "conferio" && <div className="navGroup">Drive views</div>}
         {navItems.map((n, i) => (
           <div key={n.label}>
-            {i === 2 && design !== "conferio" && <div className="navGroup">Types</div>}
+            {i === 4 && <div className="navGroup">Types</div>}
             <button
               type="button"
               className={`navItem ${n.active ? "on" : ""} ${n.label === "My Drive" && dropTarget === "nav-root" ? "dropOn" : ""}`}
@@ -1086,12 +1248,31 @@ export default function Drive() {
           const hasFolder = selectedEntries.some((x) => x.type === "folder");
           return (
             <>
-              <IconButton icon={Download} label="Download" disabled={!files.length} onClick={() => void download(files)} />
-              <IconButton icon={FolderInput} label="Move to…" disabled={!files.length || hasFolder} onClick={() => setDialog({ kind: "move", files })} />
-              {selectedEntries.length === 1 && (
-                <IconButton icon={Pencil} label="Rename" onClick={() => setDialog({ kind: "rename", entry: selectedEntries[0] })} />
+              {view.type === "trash" ? (
+                <>
+                  <button type="button" className="btn ghost sm" onClick={() => void restore(selectedEntries).catch(fail)}>
+                    <Undo2 size={16} aria-hidden /> Restore
+                  </button>
+                  <button type="button" className="btn ghost sm danger" onClick={() => setDialog({ kind: "forever", entries: selectedEntries })}>
+                    <Trash2 size={16} aria-hidden /> Delete forever
+                  </button>
+                </>
+              ) : (
+                <>
+                  <IconButton icon={Download} label="Download" disabled={!files.length} onClick={() => void download(files)} />
+                  <IconButton icon={FolderInput} label="Move to…" disabled={!files.length || hasFolder} onClick={() => setDialog({ kind: "move", files })} />
+                  <IconButton
+                    icon={selectedEntries.every(isStarred) ? StarOff : Star}
+                    label={selectedEntries.every(isStarred) ? "Remove from Starred" : "Add to Starred"}
+                    onClick={() => void setStar(selectedEntries, !selectedEntries.every(isStarred))}
+                  />
+                  <IconButton icon={ArrowRightLeft} label="Change storage" onClick={() => setDialog({ kind: "storage", entries: selectedEntries })} />
+                  {selectedEntries.length === 1 && (
+                    <IconButton icon={Pencil} label="Rename" onClick={() => setDialog({ kind: "rename", entry: selectedEntries[0] })} />
+                  )}
+                  <IconButton icon={Trash2} label="Move to trash" className="danger" onClick={() => void moveToTrash(selectedEntries)} />
+                </>
               )}
-              <IconButton icon={Trash2} label="Delete" className="danger" onClick={() => setDialog({ kind: "delete", entries: selectedEntries })} />
             </>
           );
         })()}
@@ -1221,7 +1402,7 @@ export default function Drive() {
             </th>
             {sortHead("name", "Name", "cName")}
             {showLocation && <th className="cLoc">Location</th>}
-            {sortHead("date", "Date added", "cDate")}
+            {sortHead("date", view.type === "trash" ? "Trashed" : "Date added", "cDate")}
             {sortHead("size", "Size", "cSize")}
             <th className="cWhere">Stored in</th>
             <th className="cAct">
@@ -1239,6 +1420,7 @@ export default function Drive() {
                   <span className="nameText" title={e.name}>
                     {e.name}
                   </span>
+                  {isStarred(e) && <Star size={14} className="starMark" aria-label="Starred" />}
                   {e.type === "file" && e.file.status !== "ready" && <span className="badge warn">Incomplete</span>}
                 </span>
               </td>
@@ -1284,6 +1466,7 @@ export default function Drive() {
                 <span className="nameText" title={e.name}>
                   {e.name}
                 </span>
+                {isStarred(e) && <Star size={14} className="starMark" aria-label="Starred" />}
                 {kebab(e)}
               </div>
             ))}
@@ -1303,6 +1486,7 @@ export default function Drive() {
                     <span className="nameText" title={f.name}>
                       {f.name}
                     </span>
+                    {f.starred && <Star size={14} className="starMark" aria-label="Starred" />}
                     {kebab(e)}
                   </div>
                   <div className="thumb">
@@ -1340,6 +1524,22 @@ export default function Drive() {
           <Search size={44} aria-hidden />
           <h3>No files match “{view.q}”</h3>
           <p className="muted">Try a different word, or check the spelling.</p>
+        </div>
+      );
+    if (view.type === "trash")
+      return (
+        <div className="empty">
+          <Trash2 size={44} aria-hidden />
+          <h3>Trash is empty</h3>
+          <p className="muted">Things you delete stay here for {trashDays} days, so you can restore them.</p>
+        </div>
+      );
+    if (view.type === "starred")
+      return (
+        <div className="empty">
+          <Star size={44} aria-hidden />
+          <h3>Nothing starred yet</h3>
+          <p className="muted">Star files and folders you use often to find them here quickly.</p>
         </div>
       );
     if (view.type !== "folder")
@@ -1408,20 +1608,11 @@ export default function Drive() {
           )}
           {searchBox}
           <div className="topActions">
-            <label className="destPick" title="Where new uploads are stored">
-              <span className="sr">Save new uploads to</span>
+            <label className="destPick" title="Default storage for new uploads (saved to your account)">
+              <span className="sr">Default storage for new uploads</span>
               <Cloud size={16} aria-hidden />
-              <select value={dest} onChange={(e) => chooseDest(e.target.value)}>
-                <option value="telegram">Telegram</option>
-                {pool?.r2.configured && <option value="r2">Cloudflare R2 ({formatBytes(pool.r2.free)} free)</option>}
-                {pool && pool.google.some((g) => !g.needsReauth) && <option value="gdrive">Google Drive (most free)</option>}
-                {pool?.google
-                  .filter((g) => !g.needsReauth)
-                  .map((g) => (
-                    <option key={g.id} value={`gdrive:${g.id}`}>
-                      {g.email} ({g.free == null ? "unlimited" : `${formatBytes(g.free)} free`})
-                    </option>
-                  ))}
+              <select value={dest} onChange={(e) => void chooseDest(e.target.value)}>
+                <StorageOptions pool={pool} current={dest} />
               </select>
             </label>
             {design !== "classic" && newButton()}
@@ -1441,6 +1632,14 @@ export default function Drive() {
 
         <div className="panel">
           {toolbar}
+          {view.type === "trash" && (results?.files.length || results?.folders.length) ? (
+            <div className="banner info">
+              <Trash2 size={16} aria-hidden /> Items in the trash are deleted forever after {trashDays} days.
+              <button type="button" className="linkBtn" onClick={() => setDialog({ kind: "emptyTrash" })}>
+                Empty trash
+              </button>
+            </div>
+          ) : null}
           {chips}
           {loadError && entries.length > 0 && (
             <div className="banner error" role="alert">
@@ -1569,19 +1768,43 @@ export default function Drive() {
           }}
         />
       )}
-      {dialog?.kind === "delete" && (
+      {dialog?.kind === "forever" && (
         <ConfirmDialog
-          title={dialog.entries.length === 1 ? `Delete “${dialog.entries[0].name}”?` : `Delete ${dialog.entries.length} items?`}
+          title={dialog.entries.length === 1 ? `Delete “${dialog.entries[0].name}” forever?` : `Delete ${dialog.entries.length} items forever?`}
           body={
             <p>
-              {dialog.entries.some((e) => e.type === "folder")
-                ? "Folders are deleted with everything inside them. "
-                : ""}
-              This can&apos;t be undone.
+              {dialog.entries.some((e) => e.type === "folder") ? "Folders are deleted with everything inside them. " : ""}
+              The stored bytes are removed from Telegram, R2 and Google Drive. This can&apos;t be undone.
             </p>
           }
+          confirmText="Delete forever"
           onClose={() => setDialog(null)}
-          onConfirm={() => doDelete(dialog.entries)}
+          onConfirm={() => deleteForever(dialog.entries)}
+        />
+      )}
+      {dialog?.kind === "emptyTrash" && (
+        <ConfirmDialog
+          title="Empty the trash?"
+          body={<p>Everything in the trash will be deleted forever. This can&apos;t be undone.</p>}
+          confirmText="Empty trash"
+          onClose={() => setDialog(null)}
+          onConfirm={async () => {
+            const r = await api<{ deleted: number }>("/api/trash", { method: "DELETE" });
+            void load(viewRef.current, true);
+            void loadPool();
+            toast("success", `Deleted ${plural(r.deleted)} forever.`);
+          }}
+        />
+      )}
+      {dialog?.kind === "storage" && (
+        <StorageDialog
+          entries={dialog.entries}
+          pool={pool}
+          onClose={() => setDialog(null)}
+          onChoose={(target) => {
+            setDialog(null);
+            void changeStorage(dialog.entries, target);
+          }}
         />
       )}
       {dialog?.kind === "move" && (
@@ -1630,6 +1853,103 @@ export default function Drive() {
 }
 
 // ---------- pieces ----------
+
+const isStarred = (e: Entry) => (e.type === "folder" ? !!e.folder.starred : !!e.file.starred);
+
+function storageLabel(v: string, pool: Pool | null) {
+  if (v === "telegram") return "Telegram";
+  if (v === "r2") return "Cloudflare R2";
+  if (v === "gdrive") return "Google Drive";
+  const acct = pool?.google.find((g) => `gdrive:${g.id}` === v);
+  return acct ? `Google Drive (${acct.email})` : "Google Drive";
+}
+
+function StorageOptions({ pool, current }: { pool: Pool | null; current: string }) {
+  const google = pool?.google ?? [];
+  const known = ["gdrive", "telegram", "r2", ...google.map((g) => `gdrive:${g.id}`)];
+  return (
+    <>
+      <option value="gdrive">Google Drive (most free space)</option>
+      {google.map((g) => (
+        <option key={g.id} value={`gdrive:${g.id}`} disabled={g.needsReauth}>
+          Google: {g.email} ({g.needsReauth ? "reconnect needed" : g.free == null ? "unlimited" : `${formatBytes(g.free)} free`})
+        </option>
+      ))}
+      <option value="telegram">Telegram</option>
+      {pool?.r2.configured && <option value="r2">Cloudflare R2 ({formatBytes(pool.r2.free)} free)</option>}
+      {!known.includes(current) && <option value={current}>{storageLabel(current, pool)}</option>}
+    </>
+  );
+}
+
+function StorageDialog({
+  entries,
+  pool,
+  onClose,
+  onChoose,
+}: {
+  entries: Entry[];
+  pool: Pool | null;
+  onClose: () => void;
+  onChoose: (target: string) => void;
+}) {
+  const [target, setTarget] = useState("gdrive");
+  const files = entries.filter((e): e is Extract<Entry, { type: "file" }> => e.type === "file");
+  const folders = entries.length - files.length;
+  const current = new Set(files.map((e) => (e.file.backend === "gdrive" ? "Google Drive" : e.file.backend === "r2" ? "Cloudflare R2" : "Telegram")));
+  const options: { value: string; label: string; hint: string; disabled?: boolean }[] = [
+    { value: "gdrive", label: "Google Drive", hint: "The connected account with the most free space" },
+    ...(pool?.google ?? []).map((g) => ({
+      value: `gdrive:${g.id}`,
+      label: g.email,
+      hint: g.needsReauth ? "Reconnect this account first" : g.free == null ? "Unlimited" : `${formatBytes(g.free)} free`,
+      disabled: g.needsReauth,
+    })),
+    { value: "telegram", label: "Telegram", hint: "No fixed limit" },
+    ...(pool?.r2.configured ? [{ value: "r2", label: "Cloudflare R2", hint: `${formatBytes(pool.r2.free)} free · fastest` }] : []),
+  ];
+  return (
+    <Modal
+      title="Change storage"
+      onClose={onClose}
+      footer={
+        <div className="modalActions end">
+          <button type="button" className="btn ghost" onClick={onClose}>
+            Cancel
+          </button>
+          <button type="button" className="btn primary" onClick={() => onChoose(target)}>
+            <ArrowRightLeft size={16} aria-hidden /> Move
+          </button>
+        </div>
+      }
+    >
+      <p className="muted small" style={{ marginTop: 0 }}>
+        {entries.length === 1 ? `“${entries[0].name}”` : `${entries.length} items`}
+        {folders ? " (folders include everything inside)" : ""}
+        {current.size ? ` · now in ${[...current].join(", ")}` : ""}. Files are copied to the new storage, then removed from the old
+        one. Keep this tab open until it finishes.
+      </p>
+      <div className="optionList" role="radiogroup" aria-label="Target storage">
+        {options.map((o) => (
+          <label key={o.value} className={`optionRow ${target === o.value ? "on" : ""} ${o.disabled ? "disabled" : ""}`}>
+            <input
+              type="radio"
+              name="target"
+              value={o.value}
+              checked={target === o.value}
+              disabled={o.disabled}
+              onChange={() => setTarget(o.value)}
+            />
+            <span className="optionText">
+              <strong>{o.label}</strong>
+              <span className="muted small">{o.hint}</span>
+            </span>
+          </label>
+        ))}
+      </div>
+    </Modal>
+  );
+}
 
 function Thumb({ file }: { file: FileItem }) {
   const [state, setState] = useState<"loading" | "ok" | "error">("loading");

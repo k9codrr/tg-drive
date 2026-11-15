@@ -45,7 +45,7 @@ export async function GET(req: NextRequest) {
     const recent = sp.get("recent") === "1";
     if (!q && !type && !recent) return NextResponse.json({ files: [] });
 
-    const where: Prisma.FileWhereInput = { userId: big(uid), AND: [] };
+    const where: Prisma.FileWhereInput = { userId: big(uid), trashedAt: null, transferOf: null, AND: [] };
     const and = where.AND as Prisma.FileWhereInput[];
     if (q) and.push({ name: { contains: q, mode: "insensitive" } });
     if (type) and.push(type);

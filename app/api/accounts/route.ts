@@ -17,7 +17,7 @@ export async function GET(req: NextRequest) {
     if (googleConfigured()) await refreshStaleQuotas(uid, req.nextUrl.searchParams.get("refresh") === "1");
 
     const [user, accounts, usage, r2] = await Promise.all([
-      prisma.user.findUnique({ where: { id: userId }, select: { email: true, name: true } }),
+      prisma.user.findUnique({ where: { id: userId }, select: { email: true, name: true, defaultStorage: true } }),
       prisma.googleAccount.findMany({
         where: { userId },
         orderBy: { createdAt: "asc" },
@@ -33,7 +33,7 @@ export async function GET(req: NextRequest) {
       }),
       prisma.file.groupBy({
         by: ["backend", "gdAccountId"],
-        where: { userId, status: "ready" },
+        where: { userId, status: "ready", transferOf: null },
         _count: { _all: true },
         _sum: { size: true },
       }),
@@ -69,6 +69,7 @@ export async function GET(req: NextRequest) {
 
     return NextResponse.json({
       user: { email: user.email, name: user.name ?? null },
+      defaultStorage: user.defaultStorage,
       googleConfigured: googleConfigured(),
       telegram: { configured: !!(process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_CHAT_ID), ...tg },
       r2: r2 ? { configured: true, ...r2 } : { configured: false, used: 0, files: 0, limit: 0, free: 0 },

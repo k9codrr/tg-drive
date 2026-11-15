@@ -30,6 +30,8 @@ export const fileOutSelect = {
   folderId: true,
   createdAt: true,
   backend: true,
+  starred: true,
+  trashedAt: true,
   gdAccount: { select: { email: true } },
 } satisfies Prisma.FileSelect;
 
@@ -46,6 +48,8 @@ export function fileOut(r: FileOutRow) {
     createdAt: r.createdAt,
     backend: r.backend ?? "telegram",
     account: r.gdAccount?.email ?? null,
+    starred: r.starred,
+    trashedAt: r.trashedAt,
   };
 }
 
@@ -61,7 +65,8 @@ export function byName<T extends { name: string }>(rows: T[]) {
 /** Find-or-create a folder by name inside parent (null = root) for a user. */
 export async function ensureFolder(uid: string, parentId: string | null, name: string): Promise<string> {
   const where = { userId: big(uid), parentId: bigOrNull(parentId), name };
-  const found = await prisma.folder.findFirst({ where, select: { id: true } });
+  const live = { ...where, trashedAt: null };
+  const found = await prisma.folder.findFirst({ where: live, select: { id: true } });
   if (found) return String(found.id);
   try {
     const created = await prisma.folder.create({ data: where, select: { id: true } });
@@ -69,13 +74,13 @@ export async function ensureFolder(uid: string, parentId: string | null, name: s
   } catch (e) {
     // Created by a parallel request in the meantime (unique index folders_user_parent_name).
     if (!isUniqueViolation(e)) throw e;
-    const again = await prisma.folder.findFirst({ where, select: { id: true } });
+    const again = await prisma.folder.findFirst({ where: live, select: { id: true } });
     if (!again) throw new Error("Could not create folder");
     return String(again.id);
   }
 }
 
 export async function folderExists(uid: string, id: string) {
-  const n = await prisma.folder.count({ where: { id: big(id), userId: big(uid) } });
+  const n = await prisma.folder.count({ where: { id: big(id), userId: big(uid), trashedAt: null } });
   return n > 0;
 }

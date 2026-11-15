@@ -1,8 +1,8 @@
 import { NextResponse } from "next/server";
-import { purgeStorage } from "@/lib/cleanup";
 import { big, bigOrNull, fileOut, fileOutSelect, folderExists, prisma } from "@/lib/db";
 import { cleanName, fail, HttpError, parseId, readJson } from "@/lib/http";
 import { requireUser } from "@/lib/session";
+import { deleteForever, trashFiles } from "@/lib/trash";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -37,7 +37,7 @@ export async function GET(req: Request, { params }: Ctx) {
   }
 }
 
-// PATCH /api/files/:id { name?, folderId? } → rename and/or move
+// PATCH /api/files/:id { name?, folderId?, starred? } → rename, move, star
 export async function PATCH(req: Request, { params }: Ctx) {
   try {
     const uid = await requireUser(req);
@@ -53,20 +53,24 @@ export async function PATCH(req: Request, { params }: Ctx) {
       if (folderId && !(await folderExists(uid, folderId))) throw new HttpError(404, "Folder not found");
       await prisma.file.update({ where: { id: big(id) }, data: { folderId: bigOrNull(folderId) } });
     }
+    if ("starred" in body) {
+      await prisma.file.update({ where: { id: big(id) }, data: { starred: body.starred === true } });
+    }
     return NextResponse.json({ ok: true });
   } catch (e) {
     return fail(e);
   }
 }
 
-// DELETE /api/files/:id → removes the stored bytes and the DB rows
+// DELETE /api/files/:id            → moves the file to the trash
+// DELETE /api/files/:id?forever=1  → removes the stored bytes and the DB rows for good
 export async function DELETE(req: Request, { params }: Ctx) {
   try {
     const uid = await requireUser(req);
     const id = await fileId(params);
     await assertOwned(uid, id);
-    await purgeStorage([id]);
-    await prisma.file.delete({ where: { id: big(id) } });
+    if (new URL(req.url).searchParams.get("forever") === "1") await deleteForever(uid, [big(id)], []);
+    else await trashFiles(uid, [big(id)]);
     return NextResponse.json({ ok: true });
   } catch (e) {
     return fail(e);

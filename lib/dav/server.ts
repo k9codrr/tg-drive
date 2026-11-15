@@ -7,8 +7,17 @@ import { purgeStorage } from "../cleanup";
 import { CHUNK_SIZE } from "../config";
 import { big, isForeignKeyViolation, isUniqueViolation, prisma } from "../db";
 import { verifyBasicAuth } from "../devices";
-import { accessTokenFor, downloadRange } from "../google";
-import { r2Configured, r2Usage } from "../r2";
+import type { Prisma } from "@prisma/client";
+import {
+  accessTokenFor,
+  downloadRange,
+  driveRetry,
+  pickAccount,
+  putResumableSafe,
+  startResumable,
+  uploadMultipart,
+} from "../google";
+import { telegramConfigured, withGoogleFallback } from "../storage";
 import { type ChunkedBackend, readChunk, storeChunk } from "../store";
 import {
   children,
@@ -156,22 +165,26 @@ function responseXml(segs: string[], node: Node, quota?: { used: number; availab
 
 /**
  * Space shown for the drive in Windows. Free space is what the drive can actually write to:
- *   R2:       the real free space left under R2_TOTAL_LIMIT_GB / R2_USER_LIMIT_GB
+ *   Google:   free space across the connected Google accounts (new files go there first)
  *   Telegram: no real cap, so an allowance (DAV_TELEGRAM_QUOTA_GB, default 1024) minus what you
  *             already store there; 0 if Telegram isn't configured.
- * Google Drive isn't counted: the drive never writes new files there.
+ * R2 isn't counted: the drive never writes there unless DAV_BACKEND=r2.
  */
 async function driveQuota(uid: string) {
   const userId = big(uid);
-  const tgOk = !!(process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_CHAT_ID);
-  const [used, tgUsed, r2] = await Promise.all([
-    prisma.file.aggregate({ where: { userId, status: "ready" }, _sum: { size: true } }),
+  const [used, tgUsed, google] = await Promise.all([
+    prisma.file.aggregate({ where: { userId, status: "ready", trashedAt: null, transferOf: null }, _sum: { size: true } }),
     prisma.file.aggregate({ where: { userId, backend: "telegram" }, _sum: { size: true } }),
-    r2Configured() ? r2Usage(uid) : null,
+    prisma.googleAccount.findMany({ where: { userId, needsReauth: false }, select: { quotaLimit: true, quotaUsage: true } }),
   ]);
   const tgAllowance = Number(process.env.DAV_TELEGRAM_QUOTA_GB || 1024) * 1024 ** 3;
-  const tgFree = tgOk ? Math.max(0, tgAllowance - Number(tgUsed._sum.size ?? 0)) : 0;
-  return { used: Number(used._sum.size ?? 0), available: (r2?.free ?? 0) + tgFree };
+  const tgFree = telegramConfigured() ? Math.max(0, tgAllowance - Number(tgUsed._sum.size ?? 0)) : 0;
+  // Unlimited Google accounts are shown as 100 TB.
+  const gFree = google.reduce(
+    (sum, a) => sum + (a.quotaLimit == null ? 100 * 1024 ** 4 : Math.max(0, Number(a.quotaLimit) - Number(a.quotaUsage))),
+    0,
+  );
+  return { used: Number(used._sum.size ?? 0), available: gFree + tgFree };
 }
 
 async function propfind(uid: string, segs: string[], req: IncomingMessage, res: ServerResponse) {
@@ -296,25 +309,47 @@ const validName = (name: string) => {
   return n;
 };
 
-// Cached R2 free space, decremented as uploads are assigned (avoids 3 queries per small file).
-const r2Free = new Map<string, { free: number; at: number }>();
+/**
+ * Where the drive writes a new file. For now: the Google account with the most free space; if no Google
+ * account can take it (none connected, full, needs reconnecting) or the size isn't known up front,
+ * Telegram. Never R2. DAV_BACKEND=telegram|r2 overrides this.
+ */
+type Dest =
+  | { backend: "gdrive"; accountId: string; token: string; parent: string | null }
+  | { backend: ChunkedBackend };
 
-async function pickBackend(uid: string, size: number): Promise<ChunkedBackend> {
-  const tgOk = !!(process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_CHAT_ID);
-  const preferR2 = process.env.DAV_LARGE_BACKEND === "r2";
-  if (r2Configured() && (size < CHUNK_SIZE || preferR2 || !tgOk)) {
-    let c = r2Free.get(uid);
-    if (!c || Date.now() - c.at > 30_000) {
-      c = { free: (await r2Usage(uid)).free, at: Date.now() };
-      r2Free.set(uid, c);
-    }
-    if (c.free >= size) {
-      c.free -= size;
-      return "r2";
+async function pickDest(uid: string, size: number | null): Promise<Dest> {
+  const forced = process.env.DAV_BACKEND;
+  if (forced === "telegram" || forced === "r2") return { backend: forced };
+  if (size == null) return { backend: "telegram" };
+  return withGoogleFallback<Dest>(
+    { backend: "gdrive", accountId: null, auto: true },
+    async () => {
+      const a = await pickAccount(uid, size, null);
+      const { token, row } = await accessTokenFor(a.id);
+      return { backend: "gdrive", accountId: a.id, token, parent: row.rootFolderId || null };
+    },
+    async () => ({ backend: "telegram" }),
+  );
+}
+
+/** Reads a request body in pieces of exactly `size` bytes (the last one may be shorter). */
+async function* pieces(req: IncomingMessage, size: number) {
+  const pending: Buffer[] = [];
+  let buffered = 0;
+  for await (const part of req as AsyncIterable<Buffer>) {
+    pending.push(part);
+    buffered += part.length;
+    while (buffered >= size) {
+      const all = Buffer.concat(pending);
+      pending.length = 0;
+      const rest = all.subarray(size);
+      if (rest.length) pending.push(Buffer.from(rest));
+      buffered = rest.length;
+      yield all.subarray(0, size);
     }
   }
-  if (tgOk) return "telegram";
-  throw new DavError(507, "No storage backend has room for this file");
+  if (buffered > 0) yield Buffer.concat(pending);
 }
 
 async function put(uid: string, segs: string[], req: IncomingMessage, res: ServerResponse) {
@@ -329,77 +364,97 @@ async function put(uid: string, segs: string[], req: IncomingMessage, res: Serve
   // Previous versions (and leftovers of failed uploads) are replaced once the new one is complete.
   // Both lookups run in parallel: every database query is a network round trip.
   const [clash, previous] = await Promise.all([
-    prisma.folder.count({ where: { userId: big(uid), parentId: parent, name } }),
-    prisma.file.findMany({ where: { userId: big(uid), folderId: parent, name }, select: { id: true } }),
+    prisma.folder.count({ where: { userId: big(uid), parentId: parent, name, trashedAt: null } }),
+    prisma.file.findMany({
+      where: { userId: big(uid), folderId: parent, name, trashedAt: null, transferOf: null },
+      select: { id: true },
+    }),
   ]);
   if (clash) throw new DavError(405, "A folder with that name exists");
 
-  let fileId: bigint | null = null;
-  let backend: ChunkedBackend = "telegram";
-  let idx = 0;
-  let total = 0;
-  const pending: Buffer[] = [];
-  let buffered = 0;
-
-  const ensureFile = async (sizeHint: number) => {
-    if (fileId != null) return fileId;
-    backend = await pickBackend(uid, sizeHint);
-    const row = await prisma.file
-      .create({
-        data: {
-          userId: big(uid),
-          name,
-          folderId: parent,
-          size: BigInt(declared ?? 0),
-          mime: mimeFor(name),
-          chunkSize: CHUNK_SIZE,
-          chunkCount: 0,
-          status: "uploading",
-          backend,
-        },
-        select: { id: true },
-      })
-      .catch((e) => {
-        // The parent folder was deleted (or the cached id was stale): a client error, not a crash.
-        if (isForeignKeyViolation(e)) {
-          clearFolderCache();
-          throw new DavError(409, "Parent folder does not exist");
-        }
-        throw e;
-      });
-    return (fileId = row.id);
-  };
-  let finished = false;
-  const flush = async (buf: Buffer, sizeHint: number, last = false) => {
-    const id = await ensureFile(sizeHint);
-    const finish = last ? { size: total } : undefined;
-    await storeChunk(uid, id, idx++, backend, buf, { waitOnRateLimit: true, finish });
-    finished = last;
-  };
-
-  try {
-    for await (const part of req as AsyncIterable<Buffer>) {
-      pending.push(part);
-      buffered += part.length;
-      total += part.length;
-      while (buffered >= CHUNK_SIZE) {
-        const all = Buffer.concat(pending);
-        pending.length = 0;
-        const rest = all.subarray(CHUNK_SIZE);
-        if (rest.length) pending.push(Buffer.from(rest));
-        buffered = rest.length;
-        await flush(all.subarray(0, CHUNK_SIZE), declared ?? CHUNK_SIZE * 2);
+  const mime = mimeFor(name);
+  const base = { userId: big(uid), name, folderId: parent, mime, chunkSize: CHUNK_SIZE };
+  type Extra = Omit<Prisma.FileUncheckedCreateInput, "userId" | "name" | "folderId" | "mime" | "chunkSize">;
+  const createRow = (data: Extra) =>
+    prisma.file.create({ data: { ...base, ...data }, select: { id: true } }).catch((e) => {
+      // The parent folder was deleted (or the cached id was stale): a client error, not a crash.
+      if (isForeignKeyViolation(e)) {
+        clearFolderCache();
+        throw new DavError(409, "Parent folder does not exist");
       }
-    }
-    if (declared != null && declared !== total) throw new DavError(400, "Upload was cut short");
-    // The last chunk also marks the file ready (one query instead of two).
-    if (buffered > 0) await flush(Buffer.concat(pending), declared ?? total, true);
-    if (!finished) {
-      const id = await ensureFile(total);
-      await prisma.file.update({
-        where: { id },
-        data: { size: BigInt(total), chunkCount: idx, status: "ready" },
-      });
+      throw e;
+    });
+
+  let fileId: bigint | null = null;
+  try {
+    if (declared === 0) {
+      await drain(req);
+      await createRow({ size: BigInt(0), chunkCount: 0, status: "ready", backend: "telegram" });
+    } else {
+      const dest = await pickDest(uid, declared);
+      if (dest.backend === "gdrive" && declared != null) {
+        const meta = { name, mime, parentId: dest.parent };
+        if (declared <= CHUNK_SIZE) {
+          // Small file: one request.
+          const parts: Buffer[] = [];
+          for await (const part of req as AsyncIterable<Buffer>) parts.push(part);
+          const body = Buffer.concat(parts);
+          if (body.length !== declared) throw new DavError(400, "Upload was cut short");
+          const driveId = await driveRetry(() => uploadMultipart(dest.token, meta, body));
+          await createRow({
+            size: BigInt(declared),
+            chunkCount: 1,
+            status: "ready",
+            backend: "gdrive",
+            gdAccountId: big(dest.accountId),
+            gdFileId: driveId,
+            uploadedBytes: BigInt(declared),
+          });
+        } else {
+          // Big file: resumable upload, streamed 4 MB at a time.
+          const url = await driveRetry(() => startResumable(dest.token, { ...meta, size: declared }));
+          const row = await createRow({
+            size: BigInt(declared),
+            chunkCount: Math.ceil(declared / CHUNK_SIZE),
+            status: "uploading",
+            backend: "gdrive",
+            gdAccountId: big(dest.accountId),
+            gdUploadUrl: url,
+          });
+          fileId = row.id;
+          let pos = 0;
+          let driveId: string | null = null;
+          for await (const piece of pieces(req, CHUNK_SIZE)) {
+            if (pos + piece.length > declared) throw new DavError(400, "Upload is bigger than declared");
+            driveId = await putResumableSafe(url, piece, pos, declared);
+            pos += piece.length;
+          }
+          if (pos !== declared || !driveId) throw new DavError(400, "Upload was cut short");
+          await prisma.file.update({
+            where: { id: row.id },
+            data: { status: "ready", gdFileId: driveId, gdUploadUrl: null, uploadedBytes: BigInt(declared) },
+          });
+        }
+      } else {
+        // Telegram (or R2 when forced): 4 MB chunks.
+        const backend = dest.backend as ChunkedBackend;
+        let idx = 0;
+        let total = 0;
+        let last: Buffer | null = null;
+        for await (const piece of pieces(req, CHUNK_SIZE)) {
+          // Hold one piece back so the final one also marks the file ready (one query instead of two).
+          if (last) {
+            fileId ??= (await createRow({ size: BigInt(declared ?? 0), chunkCount: 0, status: "uploading", backend })).id;
+            await storeChunk(uid, fileId, idx++, backend, last, { waitOnRateLimit: true });
+          }
+          last = Buffer.from(piece);
+          total += piece.length;
+        }
+        if (declared != null && declared !== total) throw new DavError(400, "Upload was cut short");
+        fileId ??= (await createRow({ size: BigInt(total), chunkCount: 0, status: "uploading", backend })).id;
+        if (last) await storeChunk(uid, fileId, idx++, backend, last, { waitOnRateLimit: true, finish: { size: total } });
+        else await prisma.file.update({ where: { id: fileId }, data: { size: BigInt(0), chunkCount: 0, status: "ready" } });
+      }
     }
   } catch (e) {
     if (fileId != null) {

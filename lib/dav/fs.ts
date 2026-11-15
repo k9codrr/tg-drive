@@ -1,7 +1,7 @@
 // Path ⇄ database mapping for the WebDAV drive. A path is a list of names under the user's root.
 import type { Prisma } from "@prisma/client";
-import { purgeStorage } from "../cleanup";
 import { big, prisma } from "../db";
+import { trashFiles, trashFolder } from "../trash";
 
 export const fileSelect = {
   id: true,
@@ -43,7 +43,7 @@ export async function folderIdFor(uid: string, segs: string[]): Promise<bigint |
       continue;
     }
     const f: { id: bigint } | null = await prisma.folder.findFirst({
-      where: { userId: big(uid), parentId: parent, name: segs[i] },
+      where: { userId: big(uid), parentId: parent, name: segs[i], trashedAt: null },
       select: { id: true },
     });
     if (!f) return undefined;
@@ -60,12 +60,12 @@ export async function resolve(uid: string, segs: string[]): Promise<Node | null>
   if (parent === undefined) return null;
   const name = segs[segs.length - 1];
   const folder = await prisma.folder.findFirst({
-    where: { userId: big(uid), parentId: parent, name },
+    where: { userId: big(uid), parentId: parent, name, trashedAt: null },
     select: { id: true, name: true, createdAt: true, updatedAt: true },
   });
   if (folder) return { kind: "folder", ...folder };
   const file = await prisma.file.findFirst({
-    where: { userId: big(uid), folderId: parent, name, status: "ready" },
+    where: { userId: big(uid), folderId: parent, name, status: "ready", trashedAt: null, transferOf: null },
     orderBy: { createdAt: "desc" },
     select: fileSelect,
   });
@@ -76,11 +76,11 @@ export async function resolve(uid: string, segs: string[]): Promise<Node | null>
 export async function children(uid: string, folderId: bigint | null): Promise<Node[]> {
   const [folders, files] = await Promise.all([
     prisma.folder.findMany({
-      where: { userId: big(uid), parentId: folderId },
+      where: { userId: big(uid), parentId: folderId, trashedAt: null },
       select: { id: true, name: true, createdAt: true, updatedAt: true },
     }),
     prisma.file.findMany({
-      where: { userId: big(uid), folderId, status: "ready" },
+      where: { userId: big(uid), folderId, status: "ready", trashedAt: null, transferOf: null },
       orderBy: { createdAt: "desc" },
       select: fileSelect,
     }),
@@ -95,29 +95,24 @@ export async function children(uid: string, folderId: bigint | null): Promise<No
   return out;
 }
 
-/** Deletes a file (and older copies with the same name) or a whole folder tree, including stored bytes. */
+/**
+ * "Deletes" from the drive by moving to the trash (restorable from the web app for 30 days): a file
+ * (and older copies with the same name) or a whole folder tree.
+ */
 export async function deleteNode(uid: string, parentId: bigint | null, node: Node) {
   if (node.kind === "file") {
     const same = await prisma.file.findMany({
-      where: { userId: big(uid), folderId: parentId, name: node.name },
+      where: { userId: big(uid), folderId: parentId, name: node.name, trashedAt: null, transferOf: null },
       select: { id: true },
     });
-    const ids = same.map((f) => String(f.id));
-    await purgeStorage(ids);
-    await prisma.file.deleteMany({ where: { id: { in: same.map((f) => f.id) } } });
+    await trashFiles(
+      uid,
+      same.map((f) => f.id),
+    );
     return;
   }
   if (node.id == null) throw new Error("Cannot delete the root");
-  const files = await prisma.$queryRaw<{ id: bigint }[]>`
-    WITH RECURSIVE tree AS (
-      SELECT id FROM folders WHERE id = ${node.id} AND user_id = ${big(uid)}
-      UNION ALL
-      SELECT f.id FROM folders f JOIN tree t ON f.parent_id = t.id
-    )
-    SELECT id FROM files WHERE folder_id IN (SELECT id FROM tree)`;
-  await purgeStorage(files.map((f) => String(f.id)));
-  await prisma.folder.deleteMany({ where: { id: node.id, userId: big(uid) } });
-  clearFolderCache();
+  await trashFolder(uid, node.id);
 }
 
 /** True if `folderId` is `ancestorId` or somewhere inside it. */

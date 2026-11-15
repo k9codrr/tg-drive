@@ -3036,3 +3036,70 @@ pre.code {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* =====================================================================
+   Trash, starred, storage moves
+   ===================================================================== */
+.banner.info {
+  background: var(--soft);
+  color: var(--text-2);
+}
+.banner.info .linkBtn {
+  color: var(--ring);
+  text-decoration: none;
+  font-weight: 600;
+}
+.starMark {
+  flex: none;
+  color: #f5b400;
+  fill: #f5b400;
+}
+.optionList {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.optionRow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.optionRow:hover {
+  background: var(--hover);
+}
+.optionRow.on {
+  border-color: var(--ring);
+  background: var(--sel);
+}
+.optionRow.disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.optionRow input {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  box-shadow: none;
+  accent-color: var(--ring);
+  flex: none;
+}
+.optionText {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.optionText strong {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.selBar .btn.sm {
+  height: 32px;
+}

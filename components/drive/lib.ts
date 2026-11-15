@@ -1,6 +1,6 @@
 // Client-side data helpers for the drive UI: API calls, chunked upload/download, file kinds.
 
-export type Folder = { id: string; name: string; createdAt: string };
+export type Folder = { id: string; name: string; createdAt: string; starred?: boolean; trashedAt?: string | null; parentId?: string | null };
 export type FileItem = {
   id: string;
   name: string;
@@ -11,6 +11,8 @@ export type FileItem = {
   createdAt: string;
   backend: string;
   account: string | null;
+  starred?: boolean;
+  trashedAt?: string | null;
 };
 export type GoogleAccount = {
   id: string;
@@ -24,6 +26,7 @@ export type GoogleAccount = {
 };
 export type Pool = {
   user: { email: string; name: string | null };
+  defaultStorage: string;
   r2: { configured: boolean; used: number; files: number; limit: number; free: number };
   googleConfigured: boolean;
   telegram: { configured: boolean; files: number; bytes: number };

@@ -16,6 +16,9 @@ model User {
   name         String?
   passwordHash String   @map("password_hash")
   createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  // Where new uploads go: "gdrive" (account with most free space, Telegram if none fits),
+  // "gdrive:<accountId>", "telegram" or "r2".
+  defaultStorage String @default("gdrive") @map("default_storage")
 
   folders        Folder[]
   files          File[]
@@ -32,15 +35,20 @@ model Folder {
   parentId  BigInt?  @map("parent_id")
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  // Trash: everything inside a trashed folder gets the same trashed_at; trash_root marks what the
+  // user actually trashed (shown in Trash). Purged automatically after 30 days.
+  trashedAt DateTime? @map("trashed_at") @db.Timestamptz(6)
+  trashRoot Boolean   @default(false) @map("trash_root")
+  starred   Boolean   @default(false)
 
   user     User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
   parent   Folder?  @relation("FolderTree", fields: [parentId], references: [id], onDelete: Cascade)
   children Folder[] @relation("FolderTree")
   files    File[]
 
-  // A name must be unique per (user, parent) — including at the root, where parent_id is NULL.
-  // Prisma can't express that (it needs COALESCE), so the unique index
-  // "folders_user_parent_name" is created by hand in the init migration.
+  // A name must be unique per (user, parent) among folders not in the trash — including at the root,
+  // where parent_id is NULL. Prisma can't express that (COALESCE + WHERE), so the partial unique index
+  // "folders_user_parent_name" is created by hand in the migrations.
   @@map("folders")
 }
 
@@ -83,11 +91,20 @@ model File {
   uploadedBytes BigInt   @default(0) @map("uploaded_bytes")
   createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt     DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  trashedAt     DateTime? @map("trashed_at") @db.Timestamptz(6)
+  trashRoot     Boolean   @default(false) @map("trash_root")
+  starred       Boolean   @default(false)
+  // Moving a file to another storage: the copy is built in a hidden row (transfer_of = original),
+  // then swapped in. transfer_lock stops two requests copying the same file at once.
+  transferOf    BigInt?   @map("transfer_of")
+  transferLock  DateTime? @map("transfer_lock") @db.Timestamptz(6)
 
   user      User?          @relation(fields: [userId], references: [id], onDelete: Cascade)
   folder    Folder?        @relation(fields: [folderId], references: [id], onDelete: Cascade)
   gdAccount GoogleAccount? @relation(fields: [gdAccountId], references: [id], onDelete: Restrict)
   chunks    Chunk[]
+  original  File?          @relation("Transfer", fields: [transferOf], references: [id], onDelete: Cascade)
+  copies    File[]         @relation("Transfer")
 
   @@index([userId, folderId], map: "files_user_folder")
   @@index([gdAccountId], map: "files_gd_account")
