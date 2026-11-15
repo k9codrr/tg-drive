@@ -1,5 +1,6 @@
 "use client";
 
+import { Eye, EyeOff, HardDrive, Loader2 } from "lucide-react";
 import { useEffect, useState, type FormEvent } from "react";
 
 type Mode = "login" | "signup";
@@ -14,6 +15,7 @@ export default function AuthPage() {
   const [code, setCode] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [showPw, setShowPw] = useState(false);
 
   useEffect(() => {
     if (new URLSearchParams(window.location.search).get("mode") === "signup") setMode("signup");
@@ -35,12 +37,20 @@ export default function AuthPage() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(signup ? { name, email, password, code } : { email, password }),
     }).catch(() => null);
-    if (res?.ok) {
+    if (!res) {
+      setError(navigator.onLine ? "Can't reach the server. Check that TG Drive is running and try again." : "You're offline. Connect to the internet and try again.");
+      setBusy(false);
+      return;
+    }
+    if (res.ok) {
       window.location.href = "/";
       return;
     }
-    const data = res ? await res.json().catch(() => ({})) : {};
-    setError(data.error || "Something went wrong, try again");
+    const data = await res.json().catch(() => ({}));
+    setError(
+      data.error ||
+        (res.status >= 500 ? "The server had a problem. Try again in a moment." : "Something went wrong, try again"),
+    );
     setBusy(false);
   }
 
@@ -52,7 +62,12 @@ export default function AuthPage() {
   return (
     <div className="loginWrap">
       <form className="loginCard" onSubmit={submit}>
-        <h1>✈️ TG Drive</h1>
+        <div className="loginBrand">
+          <span className="brandMark" aria-hidden>
+            <HardDrive size={18} />
+          </span>
+          <h1>TG Drive</h1>
+        </div>
         <p className="muted">
           {signup ? "Create your account" : "Sign in to your storage"}: Telegram, Cloudflare R2 and Google Drive in
           one place.
@@ -70,44 +85,63 @@ export default function AuthPage() {
         )}
 
         {signup && (
-          <input placeholder="Name (optional)" value={name} onChange={(e) => setName(e.target.value)} autoComplete="name" />
+          <input placeholder="Name (optional)" aria-label="Name" value={name} onChange={(e) => setName(e.target.value)} autoComplete="name" />
         )}
         <input
           type="email"
           required
           autoFocus
           placeholder="Email"
+          aria-label="Email"
           value={email}
           onChange={(e) => setEmail(e.target.value)}
           autoComplete="email"
         />
-        <input
-          type="password"
-          required
-          minLength={signup ? 8 : undefined}
-          placeholder={signup ? "Password (min 8 characters)" : "Password"}
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          autoComplete={signup ? "new-password" : "current-password"}
-        />
+        <div className="pwField">
+          <input
+            type={showPw ? "text" : "password"}
+            required
+            minLength={signup ? 8 : undefined}
+            placeholder={signup ? "Password (min 8 characters)" : "Password"}
+            aria-label="Password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            autoComplete={signup ? "new-password" : "current-password"}
+          />
+          <button
+            type="button"
+            className="iconBtn"
+            onClick={() => setShowPw((v) => !v)}
+            aria-label={showPw ? "Hide password" : "Show password"}
+            title={showPw ? "Hide password" : "Show password"}
+          >
+            {showPw ? <EyeOff size={17} aria-hidden /> : <Eye size={17} aria-hidden />}
+          </button>
+        </div>
         {signup && (
           <input
-            type="password"
+            type={showPw ? "text" : "password"}
             required
             placeholder="Confirm password"
+            aria-label="Confirm password"
             value={confirm}
             onChange={(e) => setConfirm(e.target.value)}
             autoComplete="new-password"
           />
         )}
         {signup && policy?.needsCode && (
-          <input required placeholder="Invite code" value={code} onChange={(e) => setCode(e.target.value)} />
+          <input required placeholder="Invite code" aria-label="Invite code" value={code} onChange={(e) => setCode(e.target.value)} />
         )}
 
-        <button className="primary" disabled={busy}>
+        {error && (
+          <p className="loginError" role="alert">
+            {error}
+          </p>
+        )}
+        <button className="btn primary" disabled={busy}>
+          {busy && <Loader2 size={16} className="spin" aria-hidden />}
           {busy ? "Please wait…" : signup ? "Create account" : "Sign in"}
         </button>
-        {error && <p className="error">{error}</p>}
         {policy && !policy.allowed && <p className="muted small">New sign-ups are closed on this server.</p>}
       </form>
     </div>

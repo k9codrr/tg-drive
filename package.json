@@ -14,9 +14,13 @@
   "dependencies": {
     "@prisma/client": "6.19.3",
     "aws4fetch": "^1.0.20",
+    "jszip": "^3.10.1",
+    "lucide-react": "^0.544.0",
+    "mammoth": "^1.11.0",
     "next": "^15.3.0",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

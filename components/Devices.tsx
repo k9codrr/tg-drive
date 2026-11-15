@@ -1,6 +1,8 @@
 "use client";
 
+import { Check, Copy, KeyRound, Laptop, Plus } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
+import { Modal } from "./drive/ui";
 
 type Device = { id: string; name: string; createdAt: string; lastUsedAt: string | null };
 type Created = { id: string; name: string; token: string };
@@ -75,14 +77,7 @@ export default function DevicesModal({ onClose }: { onClose: () => void }) {
   };
 
   return (
-    <div className="modalBack" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <div className="modalHead">
-          <h2>Use as a drive on your PC</h2>
-          <button className="ghost" onClick={onClose}>
-            ✕
-          </button>
-        </div>
+    <Modal title="Use as a drive on your PC" onClose={onClose} wide>
 
         <p className="muted small">
           Mount TG Drive as drive <strong>T:</strong> in Windows. Drag files in from Explorer and open them from any
@@ -92,7 +87,7 @@ export default function DevicesModal({ onClose }: { onClose: () => void }) {
         {created ? (
           <div className="acct">
             <div className="acctTop">
-              <strong>🔑 Password for “{created.name}”</strong>
+              <strong className="withIcon"><KeyRound size={16} aria-hidden /> Password for “{created.name}”</strong>
               <span className="muted small">shown once, copy it now</span>
             </div>
             <p className="small">Run this in the tg-drive folder on that PC (PowerShell):</p>
@@ -100,10 +95,13 @@ export default function DevicesModal({ onClose }: { onClose: () => void }) {
               {setupCommand}
             </pre>
             <div className="modalActions">
-              <button className="primary" onClick={copy}>
-                {copied ? "Copied ✓" : "Copy command"}
+              <button type="button" className="btn primary" onClick={copy}>
+                {copied ? <Check size={16} aria-hidden /> : <Copy size={16} aria-hidden />}
+                {copied ? "Copied" : "Copy command"}
               </button>
-              <button onClick={() => setCreated(null)}>Done</button>
+              <button type="button" className="btn" onClick={() => setCreated(null)}>
+                Done
+              </button>
             </div>
           </div>
         ) : (
@@ -114,14 +112,23 @@ export default function DevicesModal({ onClose }: { onClose: () => void }) {
               void create();
             }}
           >
-            <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Device name, e.g. Lenovo laptop" />
-            <button className="primary" type="submit">
-              + Add this PC
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="Device name, e.g. Lenovo laptop"
+              aria-label="Device name"
+            />
+            <button className="btn primary" type="submit">
+              <Plus size={16} aria-hidden /> Add this PC
             </button>
           </form>
         )}
 
-        {error && <p className="small warn">{error}</p>}
+        {error && (
+          <p className="fieldError" role="alert">
+            {error}
+          </p>
+        )}
 
         {devices == null ? (
           <p className="muted">Loading…</p>
@@ -131,8 +138,8 @@ export default function DevicesModal({ onClose }: { onClose: () => void }) {
           devices.map((d) => (
             <div className="acct" key={d.id}>
               <div className="acctTop">
-                <strong>💻 {d.name}</strong>
-                <button className="link small danger" onClick={() => revoke(d)}>
+                <strong className="withIcon"><Laptop size={16} aria-hidden /> {d.name}</strong>
+                <button type="button" className="linkBtn small danger" onClick={() => revoke(d)}>
                   Revoke
                 </button>
               </div>
@@ -143,7 +150,6 @@ export default function DevicesModal({ onClose }: { onClose: () => void }) {
             </div>
           ))
         )}
-      </div>
-    </div>
+    </Modal>
   );
 }

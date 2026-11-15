@@ -131,3 +131,14 @@ All routes except `/api/auth/*` need the session cookie from `POST /api/auth/log
 - Vercel limits requests to ~4.5 MB, which is why chunks are 4 MB. Downloads are reassembled in the browser's memory.
 - Deleting removes the database rows. Deleting the stored bytes is best-effort.
 - **Back up the database.** It's the index for everything.
+
+## Designs
+
+On first sign-in the app asks which design to use (changeable later under **Appearance**):
+
+- **Nimbus**: palette and layout adapted from [Nimbus](https://github.com/nimbusdotstorage/Nimbus), licensed under Apache-2.0.
+- **Classic**: the familiar layout of the big cloud drives (big New button, search bar, folder cards).
+- **Conferio**: the drive pages of [Conferio](https://github.com/k9codrr/conferio).
+
+Each design has light, dark and system modes. Files open in an in-app viewer: images, video, audio, PDF,
+text/code, spreadsheets (xlsx, xls, ods, csv), Word (.docx), PowerPoint (.pptx, text), zip archives and fonts.
