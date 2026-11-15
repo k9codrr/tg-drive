@@ -154,6 +154,26 @@ function responseXml(segs: string[], node: Node, quota?: { used: number; availab
   );
 }
 
+/**
+ * Space shown for the drive in Windows. Free space is what the drive can actually write to:
+ *   R2:       the real free space left under R2_TOTAL_LIMIT_GB / R2_USER_LIMIT_GB
+ *   Telegram: no real cap, so an allowance (DAV_TELEGRAM_QUOTA_GB, default 1024) minus what you
+ *             already store there; 0 if Telegram isn't configured.
+ * Google Drive isn't counted: the drive never writes new files there.
+ */
+async function driveQuota(uid: string) {
+  const userId = big(uid);
+  const tgOk = !!(process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_CHAT_ID);
+  const [used, tgUsed, r2] = await Promise.all([
+    prisma.file.aggregate({ where: { userId, status: "ready" }, _sum: { size: true } }),
+    prisma.file.aggregate({ where: { userId, backend: "telegram" }, _sum: { size: true } }),
+    r2Configured() ? r2Usage(uid) : null,
+  ]);
+  const tgAllowance = Number(process.env.DAV_TELEGRAM_QUOTA_GB || 1024) * 1024 ** 3;
+  const tgFree = tgOk ? Math.max(0, tgAllowance - Number(tgUsed._sum.size ?? 0)) : 0;
+  return { used: Number(used._sum.size ?? 0), available: (r2?.free ?? 0) + tgFree };
+}
+
 async function propfind(uid: string, segs: string[], req: IncomingMessage, res: ServerResponse) {
   await drain(req);
   const node = await resolve(uid, segs);
@@ -161,11 +181,7 @@ async function propfind(uid: string, segs: string[], req: IncomingMessage, res: 
 
   const parts: string[] = [];
   let quota: { used: number; available: number } | undefined;
-  if (!segs.length) {
-    const agg = await prisma.file.aggregate({ where: { userId: big(uid), status: "ready" }, _sum: { size: true } });
-    // Telegram has no fixed cap; report 1 TB free so Windows shows a sensible drive size.
-    quota = { used: Number(agg._sum.size ?? 0), available: 1024 ** 4 };
-  }
+  if (!segs.length) quota = await driveQuota(uid);
   parts.push(responseXml(segs, node, quota));
   if (node.kind === "folder" && req.headers.depth !== "0") {
     for (const child of await children(uid, node.id)) parts.push(responseXml([...segs, child.name], child));
